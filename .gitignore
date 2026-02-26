@@ -1,0 +1,40 @@
+# Data & media (large files, not source code)
+anime/
+manga/
+output/
+_test_frame.jpg
+pipeline_log.txt
+
+# Model weights
+*.pt
+*.safetensors
+*.ckpt
+*.bin
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Environment
+.env
+.env.*
+*.key
+credentials.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Claude Code
+.claude/

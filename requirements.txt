@@ -1,0 +1,34 @@
+# Anime Metadata Extraction Pipeline - Dependencies
+# Install: pip install -r requirements.txt
+
+# --- Core ---
+numpy>=1.24
+opencv-python>=4.8
+
+# --- Shot detection ---
+transnetv2-pytorch         # TransNetV2 shot boundary detection (CPU-friendly)
+torch>=2.0                 # Required by transnetv2-pytorch
+
+# --- OpenAI APIs (GPT-4o Vision) ---
+openai>=1.12               # GPT-4o vision scene analysis
+
+# --- Audio classifier (Phase 6 — optional, anime: --use-audio) ---
+# librosa              # Spectral analysis for music/ambient/silence detection
+# soundfile            # Required by librosa for WAV loading
+
+# --- GPU models (Phase 5 — all optional, pipeline works without them) ---
+# ultralytics           # YOLOv8-seg character segmentation (anime: --use-yolo)
+# clip                  # CLIP background embeddings (anime: --use-clip)
+# Pillow                # Required by CLIP preprocessing
+# torchvision           # DeepLabV3 segmentation (manga: --use-segmentation)
+# timm                  # Required by MiDaS depth estimation (manga: --use-depth)
+
+# --- Already required by manga pipeline (shared) ---
+# requests
+# beautifulsoup4
+# gradio
+# flask
+# demucs
+# pyannote.audio
+# speechbrain
+# TTS (coqui)
