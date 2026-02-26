@@ -11,19 +11,22 @@
 | Max CUDA | 12.8 (but Wan2GP recommends 12.6 for Turing) |
 | SageAttention | v1.0.6 only (v2.x is NOT compatible) |
 | Flash Attention | May require compilation; SDPA is safest |
+| CUDA_LAUNCH_BLOCKING | **REQUIRED** (`set CUDA_LAUNCH_BLOCKING=1`) to prevent async CUDA crashes |
 
 ### CUDA/PyTorch Versions
 
 RTX 20XX (Turing) must use these versions per Wan2GP docs:
 
 ```
-Python:     3.10.9
+Python:     3.10.x (tested with 3.10.5)
 PyTorch:    2.6.0+cu126
 CUDA:       12.6
 Triton:     <3.3 (Windows)
 ```
 
 **WARNING**: CUDA 12.8 + PyTorch 2.7.1 is for RTX 40XX-50XX only. Using it on Turing may cause SageAttention kernel failures.
+
+**CRITICAL**: You MUST set `CUDA_LAUNCH_BLOCKING=1` on RTX 20XX. Without it, async CUDA memory operations in mmgp cause "illegal memory access" crashes after 1-6 denoising steps. The `start_wan2gp.bat` script sets this automatically.
 
 ---
 
@@ -92,13 +95,14 @@ Use **Profile 4** by default. Switch to Profile 5 if you get OOM errors.
 
 ### For Image Sequence Generation (FLF-style)
 
-| Model | Architecture | Resolution | Start+End Frame | VRAM Requirement | Notes |
-|-------|-------------|------------|-----------------|------------------|-------|
-| **I2V 480p 14B** | `i2v` | 832x480 | Yes (unofficial but works) | 11GB w/ Profile 4 | **Recommended for 11GB** |
-| FLF2V 720p 14B | `flf2v_720p` | 1280x720 | Yes (official) | 11GB w/ Profile 5 | Slower, higher quality |
-| T2V 1.3B | `t2v_1.3B` | 832x480 | No (text only) | ~6GB | Fast, no image conditioning |
+| Model | Architecture | Resolution | Start+End Frame | VRAM Requirement | Tested on 11GB | Notes |
+|-------|-------------|------------|-----------------|------------------|----------------|-------|
+| **Fun InP 1.3B** | `fun_inp_1.3B` | 832x480 | Yes (native) | ~6GB | **YES - works** | **Recommended. ~2 min/clip** |
+| I2V 480p 14B | `i2v` | 832x480 | Yes (unofficial) | 24GB+ | NO - OOM | Crashes at step 1-6/20 even with Profile 5 |
+| FLF2V 720p 14B | `flf2v_720p` | 1280x720 | Yes (official) | 24GB+ | NO - OOM | Same OOM issue as I2V 14B |
+| T2V 1.3B | `t2v_1.3B` | 832x480 | No (text only) | ~6GB | Yes | Fast, no image conditioning |
 
-**Recommendation**: Use `i2v` at 480p. It supports both start and end frame images (the description notes "End Image is not supported in the original model but seems to work well") and runs comfortably on 11GB at Profile 4.
+**Recommendation**: Use `fun_inp_1.3B` at 480p with Profile 5. It natively supports start AND end frame images, and runs in ~2 minutes per clip on RTX 2080 Ti. The 14B models (both I2V and FLF2V) crash with OOM on 11GB VRAM even with Profile 5 and quantized weights.
 
 ---
 
@@ -236,23 +240,28 @@ output/generation/<timestamp>/
 
 | Issue | Solution |
 |-------|----------|
-| OOM / CUDA out of memory | Use `--profile 5`, reduce `--frames`, use 480p |
+| "illegal memory access" CUDA crash | Set `CUDA_LAUNCH_BLOCKING=1` (start_wan2gp.bat does this). Required on RTX 20XX |
+| OOM with 14B models | 14B models don't fit on 11GB. Use `fun_inp_1.3B` instead |
+| OOM with 1.3B model | Use `--profile 5`, reduce `--frames`, use 480p |
 | SageAttention crash | Use `--attention sdpa` (default, always safe) |
 | BF16 errors | Ensure `--fp16` is set (start_wan2gp.bat does this) |
-| Very slow generation | Expected: 10-30 min per 2s clip on 11GB at Profile 4 |
+| Intermittent CUDA errors between clips | Pipeline has retry logic (3 attempts with cooldown). Use `--resume` to restart |
 | No .mp4 in output | Check Wan2GP stderr, verify model downloaded, try a UI run first |
-| Conda not found | Add conda to PATH, or edit start_wan2gp.bat with full conda path |
+| Venv not found | Run `python -m venv venv` in the wan2gp directory |
 | OpenAI errors with --flag | Set OPENAI_API_KEY env var, check API quota |
 
 ---
 
-## Expected Performance (RTX 2080 Ti, Profile 4)
+## Expected Performance (RTX 2080 Ti, Profile 5, CUDA_LAUNCH_BLOCKING=1)
 
-| Resolution | Model | Frames | Approx Time | Notes |
-|-----------|-------|--------|-------------|-------|
-| 480p | I2V 14B | 49 (~2s) | ~10-20 min | Recommended |
-| 480p | I2V 14B | 81 (~3.4s) | ~15-30 min | Longer clips |
-| 720p | FLF2V 14B | 49 (~2s) | ~20-40 min | Profile 5 recommended |
-| 480p | T2V 1.3B | 81 (~3.4s) | ~2-5 min | No image conditioning |
+Tested timings with `fun_inp_1.3B` at 480p:
 
-For a 10-image sequence (9 clips at 480p/49 frames): ~2-3 hours total.
+| Resolution | Model | Frames | Steps | Approx Time | Notes |
+|-----------|-------|--------|-------|-------------|-------|
+| 480p | Fun InP 1.3B | 17 (~0.7s) | 20 | ~2 min | Tested, working |
+| 480p | Fun InP 1.3B | 49 (~2s) | 20 | ~4-6 min | Estimated |
+| 480p | Fun InP 1.3B | 81 (~3.4s) | 30 | ~8-12 min | Estimated |
+| 480p | I2V 14B | any | any | FAILS | OOM on 11GB |
+| 720p | FLF2V 14B | any | any | FAILS | OOM on 11GB |
+
+For a 10-image sequence (9 clips at 480p/17 frames/20 steps): ~18 minutes total.

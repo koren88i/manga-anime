@@ -99,7 +99,7 @@ Sub-project 2 (manga player):
 | `utils/compare_manga_output.py` | Baseline vs new manga metadata comparison (panels, bboxes, IOU, Kumiko stats) | Utility |
 | `utils/ground_truth.py` | AssemblyAI diarization ground truth | Utility |
 | `utils/diarize_compare.py` | Multi-service diarization comparison | Utility |
-| `generation_research/generate_sequence.py` | Image sequence -> Wan2GP FLF2V/I2V video generation pipeline (subprocess, GPT-4o AI prompts, ffmpeg concat) | Working |
+| `generation_research/generate_sequence.py` | Image sequence -> Wan2GP video generation (Fun InP 1.3B, subprocess, GPT-4o AI prompts, ffmpeg concat, retry, resume) | Working |
 | `generation_research/WAN2GP_SETUP.md` | Wan2GP setup guide, GPU compatibility, pipeline usage docs | Documentation |
 | `legacy/speaker_diarization.py` | Legacy pyannote diarization | Superseded |
 | `legacy/identify.py` | Legacy CLIP character identification | Superseded |

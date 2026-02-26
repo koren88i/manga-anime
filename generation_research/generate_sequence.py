@@ -22,12 +22,14 @@ VALID_FRAME_COUNTS = [17, 33, 49, 65, 81, 97, 113, 129]
 MODEL_ARCHITECTURES = {
     "flf2v": "flf2v_720p",
     "i2v":   "i2v",
+    "fun_inp_1.3B": "fun_inp_1.3B",
 }
 
 # Default resolutions per model type
 DEFAULT_RESOLUTIONS = {
     "flf2v": "1280x720",
     "i2v":   "832x480",
+    "fun_inp_1.3B": "832x480",
 }
 
 # Resolution presets
@@ -268,18 +270,30 @@ def run_wan2gp_job(settings_path, output_dir, wan2gp_dir, conda_env,
     wan2gp_dir = Path(wan2gp_dir)
     bat_path = wan2gp_dir / "start_wan2gp.bat"
 
+    # CUDA_LAUNCH_BLOCKING=1 is required on RTX 20XX (Turing) to prevent
+    # "illegal memory access" crashes during async CUDA operations in mmgp
+    env = os.environ.copy()
+    env["CUDA_LAUNCH_BLOCKING"] = "1"
+
+    # Resolve all paths to absolute (bat file changes cwd to wan2gp dir)
+    settings_path = Path(settings_path).resolve()
+    output_dir = Path(output_dir).resolve()
+
     if bat_path.exists():
-        # Use the batch launcher (handles conda activation)
+        # Use the batch launcher (handles venv activation + defaults)
         cmd = [
             str(bat_path),
             "--process", str(settings_path),
             "--output-dir", str(output_dir),
         ]
     else:
-        # Fallback: conda run
+        # Fallback: direct venv python call
+        venv_python = wan2gp_dir / "venv" / "Scripts" / "python.exe"
+        if not venv_python.exists():
+            venv_python = "python"
         cmd = [
-            "conda", "run", "-n", conda_env, "--no-banner",
-            "python", str(wan2gp_dir / "wgp.py"),
+            str(venv_python),
+            str(wan2gp_dir / "wgp.py"),
             "--process", str(settings_path),
             "--output-dir", str(output_dir),
             "--profile", str(profile),
@@ -289,37 +303,62 @@ def run_wan2gp_job(settings_path, output_dir, wan2gp_dir, conda_env,
 
     print(f"    Command: {' '.join(str(c) for c in cmd[:6])}...")
 
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=str(wan2gp_dir),
-        )
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        if attempt > 1:
+            wait = 10 * attempt
+            print(f"    Retry {attempt}/{max_retries} after {wait}s cooldown...")
+            time.sleep(wait)
 
-        if result.returncode != 0:
-            stderr_tail = result.stderr[-500:] if result.stderr else "(no stderr)"
-            print(f"    ERROR: Wan2GP exited with code {result.returncode}")
-            print(f"    stderr: {stderr_tail}")
+        try:
+            # Track files before run to detect new outputs
+            output_path_dir = Path(output_dir)
+            existing_mp4s = set(output_path_dir.glob("*.mp4"))
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=str(wan2gp_dir),
+                env=env,
+            )
+
+            if result.returncode != 0:
+                stderr_tail = result.stderr[-500:] if result.stderr else "(no stderr)"
+                print(f"    ERROR: Wan2GP exited with code {result.returncode} (attempt {attempt})")
+                if "CUDA error" in stderr_tail or "illegal memory" in stderr_tail:
+                    print(f"    CUDA error detected, will retry...")
+                    continue
+                print(f"    stderr: {stderr_tail}")
+                if attempt < max_retries:
+                    continue
+                return None
+
+            # Find NEW video files (not existing before this run)
+            new_mp4s = set(output_path_dir.glob("*.mp4")) - existing_mp4s
+            if new_mp4s:
+                return sorted(new_mp4s, key=lambda p: p.stat().st_mtime)[-1]
+
+            # Fallback: most recently modified mp4
+            all_mp4s = sorted(output_path_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
+            if all_mp4s:
+                return all_mp4s[-1]
+
+            print("    WARNING: Wan2GP reported success but no .mp4 found")
             return None
 
-        # Find generated video in output directory
-        output_path = Path(output_dir)
-        videos = sorted(output_path.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
-        if videos:
-            return videos[-1]
+        except subprocess.TimeoutExpired:
+            print(f"    ERROR: Wan2GP timed out after {timeout}s")
+            if attempt < max_retries:
+                continue
+            return None
+        except FileNotFoundError as e:
+            print(f"    ERROR: Could not run Wan2GP: {e}")
+            print("    Make sure the wan2gp venv exists.")
+            return None
 
-        print("    WARNING: Wan2GP reported success but no .mp4 found in output")
-        return None
-
-    except subprocess.TimeoutExpired:
-        print(f"    ERROR: Wan2GP timed out after {timeout}s")
-        return None
-    except FileNotFoundError as e:
-        print(f"    ERROR: Could not run Wan2GP: {e}")
-        print("    Make sure conda is on PATH and the wan2gp env exists.")
-        return None
+    return None
 
 
 # ============================================================
@@ -443,11 +482,13 @@ examples:
         help="Video resolution (default: 480p, recommended for 11GB VRAM)",
     )
     parser.add_argument(
-        "--model-type", default="i2v", choices=["flf2v", "i2v"],
+        "--model-type", default="fun_inp_1.3B",
+        choices=["fun_inp_1.3B", "i2v", "flf2v"],
         help=(
-            "Wan2GP model type (default: i2v). "
-            "i2v = Image-to-Video 480p 14B (supports start+end frames). "
-            "flf2v = First-Last-Frame 720p 14B (official FLF model, 720p only)"
+            "Wan2GP model type (default: fun_inp_1.3B). "
+            "fun_inp_1.3B = Fun InP 1.3B (start+end frames, fits 11GB VRAM). "
+            "i2v = Image-to-Video 480p 14B (needs 24GB+). "
+            "flf2v = First-Last-Frame 720p 14B (needs 24GB+)"
         ),
     )
     parser.add_argument(
@@ -524,9 +565,11 @@ def main():
 
     # Resolve resolution string
     resolution = RESOLUTION_PRESETS.get(args.resolution, args.resolution)
-    if args.model_type == "flf2v" and args.resolution == "480p":
+    if args.model_type == "flf2v" and args.resolution != "720p":
         print("  NOTE: FLF2V model is 720p only. Overriding resolution to 720p.")
         resolution = "1280x720"
+    if args.model_type in ("i2v", "flf2v"):
+        print("  WARNING: 14B models need 24GB+ VRAM. Use fun_inp_1.3B for 11GB GPUs.")
 
     # Create output directories
     output_folder.mkdir(parents=True, exist_ok=True)
