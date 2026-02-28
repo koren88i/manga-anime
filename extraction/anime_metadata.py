@@ -570,7 +570,7 @@ def run_feature_extraction(video_path, shots, subtitle_segments, output_dir,
 # [4/9] Scene detection
 # ---------------------------------------------------------------------------
 
-def run_scene_detection(shots, output_dir):
+def run_scene_detection(shots, output_dir, subtitle_segments=None):
     """Group shots into scenes via scene_detector module."""
     scenes_cache = os.path.join(output_dir, "scenes_raw.json")
 
@@ -581,8 +581,8 @@ def run_scene_detection(shots, output_dir):
     print("[4/9] Detecting scenes...")
     from extraction.scene_detector import detect_scenes, detect_eyecatch
 
-    # Detect eyecatch first to exclude from scene grouping
-    eyecatch_ids = detect_eyecatch(shots)
+    # Detect eyecatch using subtitle gaps (primary) or fade heuristic (fallback)
+    eyecatch_ids = detect_eyecatch(shots, subtitle_segments=subtitle_segments)
 
     # Mark eyecatch shots
     for shot in shots:
@@ -590,12 +590,66 @@ def run_scene_detection(shots, output_dir):
 
     scenes = detect_scenes(shots)
 
-    # Tag eyecatch scenes
-    for scene in scenes:
-        eyecatch_shots_in_scene = [
-            sid for sid in scene["shot_ids"] if sid in eyecatch_ids
-        ]
-        scene["_is_eyecatch"] = len(eyecatch_shots_in_scene) > 0
+    # Tag eyecatch scenes — then split mixed scenes so the eyecatch
+    # portion doesn't contaminate adjacent story content
+    eyecatch_set = set(eyecatch_ids)
+    if eyecatch_set:
+        shot_map = {s["shot_id"]: s for s in shots}
+        split_scenes = []
+        for scene in scenes:
+            scene_ec = [sid for sid in scene["shot_ids"] if sid in eyecatch_set]
+            if not scene_ec:
+                # No eyecatch in this scene
+                scene["_is_eyecatch"] = False
+                split_scenes.append(scene)
+                continue
+            if len(scene_ec) == len(scene["shot_ids"]):
+                # Entire scene is eyecatch
+                scene["_is_eyecatch"] = True
+                split_scenes.append(scene)
+                continue
+
+            # Mixed scene: split into contiguous groups of eyecatch / non-eyecatch
+            groups = []
+            current_ids = []
+            current_is_ec = scene["shot_ids"][0] in eyecatch_set
+            for sid in scene["shot_ids"]:
+                is_ec = sid in eyecatch_set
+                if is_ec != current_is_ec:
+                    if current_ids:
+                        groups.append((list(current_ids), current_is_ec))
+                    current_ids = []
+                    current_is_ec = is_ec
+                current_ids.append(sid)
+            if current_ids:
+                groups.append((list(current_ids), current_is_ec))
+
+            for group_ids, is_ec in groups:
+                group_shots = [shot_map[sid] for sid in group_ids]
+                sub = {
+                    "scene_number": 0,  # re-numbered below
+                    "start_shot_id": group_ids[0],
+                    "end_shot_id": group_ids[-1],
+                    "start_time": group_shots[0]["start_time"],
+                    "end_time": group_shots[-1]["end_time"],
+                    "duration": round(group_shots[-1]["end_time"]
+                                      - group_shots[0]["start_time"], 3),
+                    "shot_count": len(group_ids),
+                    "shot_ids": group_ids,
+                    "has_flashback_candidate": any(
+                        s.get("_flashback_candidate", False) for s in group_shots
+                    ),
+                    "_is_eyecatch": is_ec,
+                }
+                split_scenes.append(sub)
+
+        # Re-number scenes sequentially
+        for i, sc in enumerate(split_scenes):
+            sc["scene_number"] = i + 1
+        scenes = split_scenes
+    else:
+        for scene in scenes:
+            scene["_is_eyecatch"] = False
 
     save_json(scenes, scenes_cache)
     print(f"[4/9] Grouped into {len(scenes)} scenes "
@@ -2114,7 +2168,8 @@ def run_pipeline(video_path, episode_id, episode_title=None,
 
     # --- Stage 4: Scene detection ---
     t = _stage_start(4)
-    scenes = run_scene_detection(shots, output_dir)
+    scenes = run_scene_detection(shots, output_dir,
+                                    subtitle_segments=subtitle_segments)
 
     # Detect recaps
     scenes = detect_recaps(scenes, subtitle_segments, prev_manifest)

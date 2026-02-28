@@ -89,6 +89,21 @@ def get_scene_at_time(episode_id, time_sec):
     return None
 
 
+def get_full_scene_at_time(episode_id, time_sec):
+    """Return the full scene dict at the given timestamp, with generic characters filtered."""
+    scene = get_scene_at_time(episode_id, time_sec)
+    if not scene:
+        return None
+
+    # Return a copy with characters filtered to real names
+    result = dict(scene)
+    result["characters_present"] = [
+        c for c in scene.get("characters_present", [])
+        if _is_real_character(c.get("name", c.get("character_id", "")))
+    ]
+    return result
+
+
 # ============================================================
 # DATA MODEL — tags, face scans, clusters
 # ============================================================
@@ -103,7 +118,7 @@ def load_tags(episode_id):
     if path.exists():
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"tags": [], "character_totals": {}}
+    return {"tags": [], "character_totals": {}, "dismissed": []}
 
 
 def save_tags(episode_id, data):
@@ -123,7 +138,7 @@ def save_tags(episode_id, data):
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-def create_tag(episode_id, character, start_sec, end_sec, subtitle_text="", face_cluster_id=None):
+def create_tag(episode_id, character, start_sec, end_sec, subtitle_text="", face_cluster_id=None, confidence="manual"):
     data = load_tags(episode_id)
     tag_id = f"tag_{uuid.uuid4().hex[:8]}"
     tag = {
@@ -133,7 +148,7 @@ def create_tag(episode_id, character, start_sec, end_sec, subtitle_text="", face
         "end_sec": round(end_sec, 2),
         "duration_sec": round(end_sec - start_sec, 2),
         "subtitle_text": subtitle_text,
-        "confidence": "manual",
+        "confidence": confidence,
         "face_cluster_id": face_cluster_id,
     }
     data["tags"].append(tag)
@@ -154,6 +169,18 @@ def update_tag(episode_id, tag_id, updates):
             tag.update(updates)
             tag["duration_sec"] = round(tag["end_sec"] - tag["start_sec"], 2)
             break
+    save_tags(episode_id, data)
+
+
+def dismiss_recommendation(episode_id, start_sec, end_sec, character):
+    """Add a subtitle+character pair to the dismissed list."""
+    data = load_tags(episode_id)
+    dismissed = data.setdefault("dismissed", [])
+    dismissed.append({
+        "start_sec": round(start_sec, 2),
+        "end_sec": round(end_sec, 2),
+        "character": character,
+    })
     save_tags(episode_id, data)
 
 
@@ -362,7 +389,99 @@ def get_recommendations(episode_id):
                 })
 
     recommendations.sort(key=lambda r: r["score"], reverse=True)
+
+    # Tag correction pass: use existing tags to improve recommendations
+    if existing_tags:
+        _apply_tag_corrections(recommendations, existing_tags, scenes)
+
+    # Filter out dismissed recommendations
+    dismissed = tags_data.get("dismissed", [])
+    if dismissed:
+        dismissed_set = {(d["start_sec"], d["end_sec"], d["character"]) for d in dismissed}
+        recommendations = [r for r in recommendations
+                           if (r["start_sec"], r["end_sec"], r["character"]) not in dismissed_set]
+
     return recommendations
+
+
+def _apply_tag_corrections(recommendations, existing_tags, scenes):
+    """Use existing manual tags to improve recommendations via process of elimination.
+
+    Only applies to scenes with 2-3 characters. If user tagged lines as character A
+    in a scene with characters A and B, remaining untagged lines probably belong to B.
+    """
+    # Build map: scene_number -> set of characters the user has tagged in that scene
+    scene_char_tags = defaultdict(set)
+    for tag in existing_tags:
+        mid = (tag["start_sec"] + tag["end_sec"]) / 2
+        for s in scenes:
+            if s["start_time_seconds"] <= mid <= s["end_time_seconds"]:
+                scene_char_tags[s["scene_number"]].add(tag["character"])
+                break
+
+    if not scene_char_tags:
+        return
+
+    # Build scene lookup by number
+    scene_by_num = {s["scene_number"]: s for s in scenes}
+
+    for rec in recommendations:
+        mid = (rec["start_sec"] + rec["end_sec"]) / 2
+        # Find which scene this rec is in
+        rec_scene = None
+        for s in scenes:
+            if s["start_time_seconds"] <= mid <= s["end_time_seconds"]:
+                rec_scene = s
+                break
+        if not rec_scene:
+            continue
+
+        scene_num = rec_scene["scene_number"]
+        tagged_chars = scene_char_tags.get(scene_num)
+        if not tagged_chars:
+            continue  # No tags in this scene, nothing to propagate
+
+        # Get real characters present in the scene
+        chars_present = set()
+        for c in rec_scene.get("characters_present", []):
+            name = c.get("name", c.get("character_id", ""))
+            if _is_real_character(name):
+                chars_present.add(name)
+
+        # Only apply for 2-3 character scenes
+        if len(chars_present) < 2 or len(chars_present) > 3:
+            continue
+
+        # Process of elimination
+        untagged_chars = chars_present - tagged_chars
+
+        if len(untagged_chars) == 1:
+            remaining_char = list(untagged_chars)[0]
+            # Only override weak suggestions — preserve strong VLM attributions
+            if rec["score"] < 0.5 and rec["character"] in tagged_chars:
+                rec["character"] = remaining_char
+                rec["score"] = 0.55
+                rec["reason"] = f"elimination: user tagged {', '.join(sorted(tagged_chars))}"
+            elif rec["character"] == remaining_char:
+                # Elimination agrees — small boost
+                rec["score"] = min(rec["score"] + 0.05, 0.85)
+            # else: keep strong VLM attribution as-is
+
+        elif len(untagged_chars) == 0:
+            # All characters have been tagged in this scene — use text_element speaker
+            for te in rec_scene.get("text_elements", []):
+                te_start = te.get("start_time_seconds", 0)
+                te_end = te.get("end_time_seconds", 0)
+                if abs(te_start - rec["start_sec"]) < 1.0 and abs(te_end - rec["end_sec"]) < 1.0:
+                    te_speaker = te.get("speaker", "")
+                    if te_speaker in tagged_chars:
+                        rec["character"] = te_speaker
+                        rec["score"] = min(rec["score"] + 0.1, 0.85)
+                        rec["reason"] = f"tag-confirmed speaker"
+                    break
+
+    # Re-sort after corrections
+    recommendations.sort(key=lambda r: r["score"], reverse=True)
 
 
 # ============================================================
@@ -670,6 +789,273 @@ def _is_real_character(name):
     return True
 
 
+def get_enriched_subtitles(episode_id):
+    """Pre-match every subtitle to its VLM text_element and compute tiers.
+
+    Returns a flat list where each subtitle carries:
+      - scene context (number, type, location, characters)
+      - vlm_match (speaker, confidence, emotion, tone_direction)
+      - existing tag (if any)
+      - tier (1=auto-confirmable, 2=needs review, 3=manual)
+      - suggested_character + score + reason
+    """
+    subtitles = extract_subtitles(episode_id)
+    scenes = load_vlm_scenes(episode_id)
+    tags_data = load_tags(episode_id)
+    existing_tags = tags_data.get("tags", [])
+    dismissed = tags_data.get("dismissed", [])
+
+    if not subtitles:
+        return []
+
+    # Build dismissed set for filtering
+    dismissed_set = {(d["start_sec"], d["end_sec"], d["character"]) for d in dismissed}
+
+    # Build tag lookup: subtitle start/end -> tag
+    tag_lookup = {}
+    for tag in existing_tags:
+        tag_lookup[(round(tag["start_sec"], 2), round(tag["end_sec"], 2))] = tag
+
+    # Build scene index for fast lookup
+    scene_list = sorted(scenes, key=lambda s: s["start_time_seconds"])
+
+    def find_scene(time_sec):
+        for s in scene_list:
+            if s["start_time_seconds"] <= time_sec <= s["end_time_seconds"]:
+                return s
+        return None
+
+    # Build enriched list
+    enriched = []
+    for idx, sub in enumerate(subtitles):
+        sub_start = sub["start"]
+        sub_end = sub["end"]
+        sub_mid = (sub_start + sub_end) / 2
+
+        # Find scene
+        scene = find_scene(sub_mid)
+
+        # Scene characters (filtered)
+        scene_chars = []
+        scene_number = None
+        scene_type = None
+        scene_location = None
+        if scene:
+            scene_number = scene.get("scene_number")
+            scene_type = scene.get("scene_type", "story")
+            scene_location = scene.get("location", "")
+            for c in scene.get("characters_present", []):
+                name = c.get("name", c.get("character_id", ""))
+                if _is_real_character(name):
+                    scene_chars.append({
+                        "name": name,
+                        "action": c.get("action", ""),
+                        "emotion": c.get("emotion", ""),
+                    })
+
+        # Find VLM text_element match by timestamp proximity
+        vlm_match = None
+        if scene:
+            best_te = None
+            best_dist = 999
+            for te in scene.get("text_elements", []):
+                if te.get("type") != "dialog":
+                    continue
+                te_start = te.get("start_time_seconds", 0)
+                dist = abs(te_start - sub_start)
+                if dist < 1.5 and dist < best_dist:
+                    best_dist = dist
+                    best_te = te
+            if best_te:
+                speaker = best_te.get("speaker", "")
+                if speaker and speaker != "Unknown" and _is_real_character(speaker):
+                    vlm_match = {
+                        "speaker": speaker,
+                        "confidence": best_te.get("speaker_confidence", 0),
+                        "emotion": best_te.get("emotion", ""),
+                        "tone_direction": best_te.get("tone_direction", ""),
+                    }
+
+        # Check existing tag
+        tag_key = (round(sub_start, 2), round(sub_end, 2))
+        existing_tag = tag_lookup.get(tag_key)
+        # Also check with tolerance
+        if not existing_tag:
+            for tag in existing_tags:
+                if abs(tag["start_sec"] - sub_start) < 0.5 and abs(tag["end_sec"] - sub_end) < 0.5:
+                    existing_tag = tag
+                    break
+
+        # Compute suggestion + tier
+        suggested_character = None
+        suggestion_score = 0
+        suggestion_reason = ""
+
+        # Auto-tag OP/ED/eyecatch
+        if scene_type in ("opening", "ending"):
+            label = "Opening Song" if scene_type == "opening" else "Ending Song"
+            suggested_character = label
+            suggestion_score = 0.95
+            suggestion_reason = f"{scene_type} section"
+        elif scene_type == "eyecatch":
+            suggested_character = "Narrator"
+            suggestion_score = 0.90
+            suggestion_reason = "eyecatch section"
+        elif vlm_match and vlm_match["confidence"] >= 0.8:
+            suggested_character = vlm_match["speaker"]
+            suggestion_score = vlm_match["confidence"]
+            suggestion_reason = "VLM speaker attribution"
+        elif len(scene_chars) == 1:
+            suggested_character = scene_chars[0]["name"]
+            suggestion_score = 0.90
+            suggestion_reason = "only character in scene"
+        elif vlm_match and vlm_match["confidence"] >= 0.4:
+            suggested_character = vlm_match["speaker"]
+            suggestion_score = vlm_match["confidence"]
+            suggestion_reason = f"VLM speaker ({len(scene_chars)} chars in scene)"
+        elif len(scene_chars) == 2 and vlm_match:
+            suggested_character = vlm_match["speaker"]
+            suggestion_score = max(vlm_match["confidence"], 0.4)
+            suggestion_reason = "2-character scene VLM guess"
+
+        # Filter dismissed suggestions
+        if suggested_character and (round(sub_start, 2), round(sub_end, 2), suggested_character) in dismissed_set:
+            suggested_character = None
+            suggestion_score = 0
+            suggestion_reason = ""
+
+        # Assign tier
+        if suggestion_score >= 0.8:
+            tier = 1
+        elif suggestion_score >= 0.4:
+            tier = 2
+        else:
+            tier = 3
+
+        enriched.append({
+            "index": idx,
+            "start": sub_start,
+            "end": sub_end,
+            "text": sub["text"],
+            "style": sub.get("style", ""),
+            "scene_number": scene_number,
+            "scene_type": scene_type,
+            "scene_location": scene_location,
+            "scene_chars": scene_chars,
+            "vlm_match": vlm_match,
+            "tag": {
+                "tag_id": existing_tag["tag_id"],
+                "character": existing_tag["character"],
+                "confidence": existing_tag.get("confidence", "manual"),
+            } if existing_tag else None,
+            "tier": tier,
+            "suggested_character": suggested_character,
+            "suggestion_score": round(suggestion_score, 3),
+            "suggestion_reason": suggestion_reason,
+        })
+
+    # Apply elimination corrections
+    _apply_enriched_corrections(enriched, existing_tags, scenes)
+
+    return enriched
+
+
+def _apply_enriched_corrections(enriched, existing_tags, scenes):
+    """Use existing tags + partial tagging to improve enriched suggestions via elimination."""
+    if not existing_tags and not any(e["tag"] for e in enriched):
+        return
+
+    # Build map: scene_number -> set of tagged characters
+    scene_char_tags = defaultdict(set)
+    for tag in existing_tags:
+        mid = (tag["start_sec"] + tag["end_sec"]) / 2
+        for s in scenes:
+            if s["start_time_seconds"] <= mid <= s["end_time_seconds"]:
+                scene_char_tags[s["scene_number"]].add(tag["character"])
+                break
+
+    if not scene_char_tags:
+        return
+
+    # Scene lookup
+    scene_by_num = {}
+    for s in scenes:
+        scene_by_num[s["scene_number"]] = s
+
+    for item in enriched:
+        if item["tag"]:
+            continue  # Already tagged, skip
+
+        sn = item["scene_number"]
+        if sn is None or sn not in scene_char_tags:
+            continue
+
+        scene = scene_by_num.get(sn)
+        if not scene:
+            continue
+
+        tagged_chars = scene_char_tags[sn]
+        chars_present = set()
+        for c in scene.get("characters_present", []):
+            name = c.get("name", c.get("character_id", ""))
+            if _is_real_character(name):
+                chars_present.add(name)
+
+        if len(chars_present) < 2 or len(chars_present) > 3:
+            continue
+
+        untagged_chars = chars_present - tagged_chars
+        if len(untagged_chars) == 1:
+            remaining = list(untagged_chars)[0]
+            # Only override weak/absent suggestions — preserve strong VLM attributions
+            if not item["suggested_character"] or item["suggestion_score"] < 0.5:
+                item["suggested_character"] = remaining
+                item["suggestion_score"] = 0.55
+                item["suggestion_reason"] = f"elimination: others tagged ({', '.join(sorted(tagged_chars))})"
+                item["tier"] = 2
+            elif item["suggested_character"] == remaining:
+                # Elimination agrees with existing suggestion — small boost
+                item["suggestion_score"] = min(item["suggestion_score"] + 0.05, 0.95)
+            # else: keep existing strong VLM suggestion as-is
+
+
+def bulk_accept_tags(episode_id, accepts):
+    """Accept multiple subtitle tags at once.
+
+    accepts: list of {start_sec, end_sec, character, subtitle_text}
+    Returns count of tags created.
+    """
+    data = load_tags(episode_id)
+    count = 0
+    for accept in accepts:
+        # Check not already tagged
+        already = False
+        for tag in data["tags"]:
+            if abs(tag["start_sec"] - accept["start_sec"]) < 0.5 and abs(tag["end_sec"] - accept["end_sec"]) < 0.5:
+                already = True
+                break
+        if already:
+            continue
+
+        tag_id = f"tag_{uuid.uuid4().hex[:8]}"
+        tag = {
+            "tag_id": tag_id,
+            "character": accept["character"],
+            "start_sec": round(accept["start_sec"], 2),
+            "end_sec": round(accept["end_sec"], 2),
+            "duration_sec": round(accept["end_sec"] - accept["start_sec"], 2),
+            "subtitle_text": accept.get("subtitle_text", ""),
+            "confidence": "auto_accepted",
+            "face_cluster_id": None,
+        }
+        data["tags"].append(tag)
+        count += 1
+
+    if count > 0:
+        save_tags(episode_id, data)
+    return count
+
+
 def get_character_names():
     """Collect all character names from VLM scene data across all episodes."""
     names = set()
@@ -686,8 +1072,11 @@ def get_character_names():
         for tag in tags_data.get("tags", []):
             if tag.get("character"):
                 names.add(tag["character"])
-    # Always include Narrator
+    # Always include special non-character tags
     names.add("Narrator")
+    names.add("Opening Song")
+    names.add("Ending Song")
+    names.add("Extra")
     return sorted(names)
 
 
@@ -709,3 +1098,68 @@ def get_episode_info(episode_id):
         "fps": round(fps, 2),
         "total_frames": total_frames,
     }
+
+
+# ============================================================
+# DIARIZATION — load results and bulk-accept tags
+# ============================================================
+def get_diarization_status(episode_id):
+    """Return cached diarization result dict, or {status: not_found}."""
+    result_path = VOICE_TAGS_DIR / episode_id / "diarization" / "result.json"
+    if not result_path.exists():
+        return {"status": "not_found", "groups": [], "total_groups": 0}
+    with open(result_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def bulk_accept_diarization(episode_id, accepts):
+    """Batch-tag subtitle lines from confirmed diarization speaker groups.
+
+    accepts: list of {cluster_id, character}
+    Returns count of tags created.
+    """
+    diar_data = get_diarization_status(episode_id)
+    if diar_data.get("status") != "done":
+        return 0
+
+    subtitles = extract_subtitles(episode_id)
+    group_by_id = {g["cluster_id"]: g for g in diar_data.get("groups", [])}
+    tags_data = load_tags(episode_id)
+    count = 0
+
+    for accept in accepts:
+        cluster_id = accept.get("cluster_id")
+        character = accept.get("character")
+        group = group_by_id.get(cluster_id)
+        if not group or not character:
+            continue
+
+        for sub_idx in group["subtitle_indices"]:
+            if sub_idx >= len(subtitles):
+                continue
+            sub = subtitles[sub_idx]
+
+            # Skip already-tagged
+            already = any(
+                abs(t["start_sec"] - sub["start"]) < 0.5
+                and abs(t["end_sec"] - sub["end"]) < 0.5
+                for t in tags_data["tags"]
+            )
+            if already:
+                continue
+
+            tags_data["tags"].append({
+                "tag_id": f"tag_{uuid.uuid4().hex[:8]}",
+                "character": character,
+                "start_sec": round(sub["start"], 2),
+                "end_sec": round(sub["end"], 2),
+                "duration_sec": round(sub["end"] - sub["start"], 2),
+                "subtitle_text": sub["text"],
+                "confidence": "diarization",
+                "face_cluster_id": cluster_id,
+            })
+            count += 1
+
+    if count > 0:
+        save_tags(episode_id, tags_data)
+    return count

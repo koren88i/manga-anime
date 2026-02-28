@@ -1,4 +1,15 @@
-# Wan2GP Setup & Image Sequence Pipeline
+# Image Sequence Generation Pipeline
+
+`generate_sequence.py` takes a folder of images and generates video clips for each consecutive pair. It supports two backends:
+
+- **Wan2GP** (`--backend wan2gp`, default) — local GPU generation via subprocess. Requires local Wan2GP installation and NVIDIA GPU. See setup below.
+- **Kling AI** (`--backend kling`) — cloud API generation. No GPU required. Requires `KLING_ACCESS_KEY` and `KLING_SECRET_KEY` in `.env`.
+
+API keys are loaded from `.env` in the project root (via `python-dotenv`).
+
+---
+
+# Wan2GP Setup
 
 ## GPU Compatibility: RTX 2080 Ti
 
@@ -159,10 +170,10 @@ python generation_research/generate_sequence.py \
 python generation_research/generate_sequence.py \
   --images-folder ./manga/0001/panels \
   --prompt "turn this manga page into an anime shot" \
-  --flag
+  --aiprompt
 ```
 
-The `--flag` option sends each image to GPT-4o which generates a detailed cinematic prompt and suggests an appropriate duration.
+The `--aiprompt` option sends each image to GPT-4o which generates a detailed cinematic prompt and suggests an appropriate duration.
 
 ### With settings template (recommended)
 
@@ -171,7 +182,7 @@ python generation_research/generate_sequence.py \
   --images-folder ./frames \
   --prompt "smooth anime transition" \
   --settings-template ./wan2gp/i2v_settings.json \
-  --flag
+  --aiprompt
 ```
 
 ### FLF2V mode at 720p
@@ -197,24 +208,43 @@ python generation_research/generate_sequence.py \
 
 ### All options
 
+#### Shared options (both backends)
+
 ```
 --images-folder PATH     Input folder with images (1.png..10.png, sorted alphabetically)
 --prompt TEXT             Base prompt for video generation
 --output-folder PATH     Output directory (default: output/generation/<timestamp>)
---flag                   Use GPT-4o to enhance prompts + suggest duration
+--backend wan2gp|kling   Video generation backend (default: wan2gp)
+--aiprompt               Use GPT-4o to enhance prompts + suggest duration
+--seed N                 Random seed (default: 42, -1 for random)
+--resume                 Skip existing clips
+--timeout N              Seconds per clip (default: 1800)
+```
+
+#### Wan2GP-only options (--backend wan2gp)
+
+```
 --resolution 480p|720p   Resolution (default: 480p)
 --model-type i2v|flf2v   Model (default: i2v, supports start+end frames at 480p)
 --frames N               Frames per clip (default: 49 = ~2s, must be 4n+1)
 --steps N                Inference steps (default: 30)
 --profile 1-5            Memory profile (default: 4)
 --attention MODE         sdpa|sage|flash|sage2 (default: sdpa)
---seed N                 Random seed (default: 42, -1 for random)
 --guidance-scale F       Guidance scale (default: 5.0)
 --settings-template PATH Exported Wan2GP settings JSON
 --wan2gp-dir PATH        Wan2GP installation path
 --wan2gp-env NAME        Conda env name (default: wan2gp)
---resume                 Skip existing clips
---timeout N              Seconds per clip (default: 1800)
+```
+
+#### Kling-only options (--backend kling)
+
+```
+--model MODEL            Kling model (default: kling-v2-6)
+--duration 5|10          Clip duration in seconds (default: 5)
+--mode std|pro           Generation mode (default: std)
+--negative-prompt TEXT   Negative prompt
+--i2v-only               Single start image, no end frame
+--poll-interval N        Seconds between status polls (default: 10)
 ```
 
 ---
@@ -248,7 +278,7 @@ output/generation/<timestamp>/
 | Intermittent CUDA errors between clips | Pipeline has retry logic (3 attempts with cooldown). Use `--resume` to restart |
 | No .mp4 in output | Check Wan2GP stderr, verify model downloaded, try a UI run first |
 | Venv not found | Run `python -m venv venv` in the wan2gp directory |
-| OpenAI errors with --flag | Set OPENAI_API_KEY env var, check API quota |
+| OpenAI errors with --aiprompt | Set OPENAI_API_KEY in `.env` or env var, check API quota |
 
 ---
 
@@ -265,3 +295,109 @@ Tested timings with `fun_inp_1.3B` at 480p:
 | 720p | FLF2V 14B | any | any | FAILS | OOM on 11GB |
 
 For a 10-image sequence (9 clips at 480p/17 frames/20 steps): ~18 minutes total.
+
+---
+
+# Kling AI Backend
+
+## Setup
+
+No local GPU or model installation needed. Just set API credentials.
+
+### 1. Get API Keys
+
+Sign up at [Kling AI Platform](https://klingai.com/) and create an API key pair (Access Key + Secret Key).
+
+### 2. Configure .env
+
+Add to your `.env` in the project root:
+
+```
+KLING_ACCESS_KEY=your_access_key_here
+KLING_SECRET_KEY=your_secret_key_here
+```
+
+### 3. Install Dependencies
+
+```bash
+pip install pyjwt requests python-dotenv
+```
+
+---
+
+## Running with Kling
+
+### Basic usage
+
+```bash
+python generation_research/generate_sequence.py \
+  --images-folder ./manga/0001/panels \
+  --prompt "One Piece anime style, dynamic action scene" \
+  --backend kling
+```
+
+### With AI prompt enhancement
+
+```bash
+python generation_research/generate_sequence.py \
+  --images-folder ./manga/0001/panels \
+  --prompt "turn this manga page into an anime shot" \
+  --backend kling \
+  --aiprompt
+```
+
+### Pro mode with 10-second clips
+
+```bash
+python generation_research/generate_sequence.py \
+  --images-folder ./frames \
+  --prompt "smooth anime transition" \
+  --backend kling \
+  --mode pro \
+  --duration 10
+```
+
+### Single image (no end frame)
+
+```bash
+python generation_research/generate_sequence.py \
+  --images-folder ./frames \
+  --prompt "anime action" \
+  --backend kling \
+  --i2v-only
+```
+
+---
+
+## Kling Models
+
+| Model | Notes |
+|-------|-------|
+| **kling-v2-6** | Latest, best quality (default) |
+| kling-v1-6 | Previous generation |
+| kling-v1-5 | Oldest supported |
+
+---
+
+## Kling Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| Missing KLING_ACCESS_KEY/SECRET_KEY | Add to `.env` file or set as env vars |
+| `ImportError: jwt` | Run `pip install pyjwt` |
+| Task timeout | Increase `--timeout`, check Kling platform status |
+| Task failed | Check Kling API error message in log output, verify image format (PNG/JPG) |
+| Rate limiting (429) | Pipeline has exponential backoff. Reduce parallel requests or wait |
+
+---
+
+## Expected Performance (Kling Cloud)
+
+| Mode | Duration | Approx Time | Cost |
+|------|----------|-------------|------|
+| std | 5s | ~1-2 min | Lower |
+| std | 10s | ~2-4 min | Lower |
+| pro | 5s | ~3-5 min | Higher |
+| pro | 10s | ~5-10 min | Higher |
+
+Times are approximate and depend on Kling API queue load.

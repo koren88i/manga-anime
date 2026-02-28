@@ -22,7 +22,7 @@ Stage 3 — Alignment               ← COMPLETE
               ↓
      Transformation Dataset
               ↓
-     Generation System            ← FUTURE
+     Generation System            ← RESEARCH (generate_sequence.py with Wan2GP + Kling backends)
 ```
 
 See each stage file for full specification:
@@ -55,4 +55,4 @@ These decisions are made and should not be re-debated during implementation.
 
 **Arc identity is a conditioning signal.** One Piece visual style, pacing, and tone vary significantly across arcs. Every manifest and alignment record carries an `arc_id` field that the generation model uses as a conditioning input.
 
-**No speaker diarization.** Dialogue content comes from episode subtitle files, not audio transcription. Speaker attribution is handled by passing subtitle lines and the shot keyframe to the VLM along with the character list. The VLM returns speaker_id and speaker_confidence per line as part of its structured output, self-reporting its own certainty. Speaker diarization adds pipeline complexity with marginal gain over this approach and is not worth the engineering cost.
+**VLM dialogue attribution is visual, not audio.** Dialogue content comes from episode subtitle files, not audio transcription. Speaker attribution in the extraction pipeline is handled by passing each scene's subtitle lines + keyframes to GPT-4o along with the character list. The VLM returns speaker_id and speaker_confidence per line — but this is a visual inference from limited keyframes, not a voice signal. The resulting `text_elements` in scene JSONs have 1:1 timestamps with subtitle lines (not independently detected). For the voice tagger, AssemblyAI speaker diarization provides a complementary audio-based signal — grouping subtitle lines by voice similarity into speaker clusters (Speaker_A, Speaker_B, etc.) without knowing character names. The two signals (VLM visual + diarization audio) are cross-referenced in the tagger for higher accuracy.

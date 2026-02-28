@@ -2,7 +2,13 @@
 
 ## Status
 
-Future phase. Not currently in implementation scope. Documented here so that Stages 1–3 are built with the right outputs to support it.
+Future phase for the full director policy model. Documented here so that Stages 1-3 are built with the right outputs to support it.
+
+**Research prototype**: `generate_sequence.py` implements step [4] (video generation) with two backends:
+- **Wan2GP** — local GPU (Fun InP 1.3B on RTX 2080 Ti), start+end frame conditioning
+- **Kling AI** — cloud API (kling-v2-6), start+end frame conditioning, 5s or 10s clips
+
+Both backends take consecutive manga panel pairs and generate transition clips. GPT-4o generates per-pair cinematic prompts when `--aiprompt` is used. See `WAN2GP_SETUP.md` for full usage docs.
 
 ## Goal
 

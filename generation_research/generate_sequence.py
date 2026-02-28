@@ -9,6 +9,13 @@ import argparse
 import subprocess
 from pathlib import Path
 
+# Load .env from project root (if python-dotenv is installed)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except ImportError:
+    pass
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -65,8 +72,15 @@ def discover_images(images_folder):
 
 
 # ============================================================
-# AI PROMPT GENERATION (--flag)
+# AI PROMPT GENERATION (--aiprompt)
 # ============================================================
+
+# Backend-specific model name for prompt context
+_BACKEND_NAMES = {
+    "wan2gp": "Wan2GP",
+    "kling":  "Kling AI",
+}
+
 
 def encode_image(image_path):
     """Read and base64-encode an image file. Returns (base64_str, media_type)."""
@@ -77,12 +91,13 @@ def encode_image(image_path):
     return data, media_type
 
 
-def generate_ai_prompt(image_path, base_prompt, client):
-    """Send image + simple prompt to GPT-4o to generate a detailed Wan2GP prompt.
+def generate_ai_prompt(image_path, base_prompt, client, backend="wan2gp"):
+    """Send image + simple prompt to GPT-4o to generate a detailed video prompt.
 
     Returns a detailed prompt string suitable for video generation.
     """
     image_b64, media_type = encode_image(image_path)
+    model_name = _BACKEND_NAMES.get(backend, backend)
 
     messages = [{
         "role": "user",
@@ -97,7 +112,7 @@ def generate_ai_prompt(image_path, base_prompt, client):
             {
                 "type": "text",
                 "text": (
-                    f'You are writing a prompt for an AI video generation model (Wan2GP).\n\n'
+                    f'You are writing a prompt for an AI video generation model ({model_name}).\n\n'
                     f'The user wants: "{base_prompt}"\n\n'
                     f'Based on this image, write a detailed video generation prompt that describes:\n'
                     f'1. The visual scene, characters, and setting visible in the image\n'
@@ -218,6 +233,242 @@ def build_wan2gp_settings(template_settings, prompt, first_frame_path,
     settings["image_end"] = str(last_frame_path) if last_frame_path else None
 
     return settings
+
+
+# ============================================================
+# KLING AI API CLIENT
+# ============================================================
+
+KLING_API_BASE_URL = "https://api.klingai.com"
+KLING_CREATE_TASK = "/v1/videos/image2video"
+KLING_QUERY_TASK = "/v1/videos/image2video/{task_id}"
+
+KLING_DEFAULT_MODEL = "kling-v2-6"
+KLING_DEFAULT_DURATION = "5"
+KLING_DEFAULT_MODE = "std"
+KLING_DEFAULT_POLL_INTERVAL = 10
+KLING_DEFAULT_TIMEOUT = 600
+KLING_TOKEN_EXPIRE = 1800
+
+KLING_VALID_DURATIONS = ["5", "10"]
+KLING_VALID_MODELS = ["kling-v1-5", "kling-v1-6", "kling-v2-6"]
+
+
+class KlingClient:
+    """Kling AI video generation API client.
+
+    Handles JWT authentication, task creation, status polling,
+    and video download. Credentials from env vars KLING_ACCESS_KEY
+    and KLING_SECRET_KEY.
+    """
+
+    def __init__(self, access_key=None, secret_key=None):
+        self.access_key = access_key or os.environ.get("KLING_ACCESS_KEY")
+        self.secret_key = secret_key or os.environ.get("KLING_SECRET_KEY")
+        if not self.access_key or not self.secret_key:
+            raise RuntimeError(
+                "Kling API keys not configured.\n"
+                "Set environment variables:\n"
+                "  KLING_ACCESS_KEY=your-access-key\n"
+                "  KLING_SECRET_KEY=your-secret-key\n"
+                "Get keys at: https://app.klingai.com/global/dev/api-key"
+            )
+        print(f"  Kling API client initialized (key: {self.access_key[:8]}...)")
+
+    def _generate_jwt_token(self):
+        import jwt
+        now = int(time.time())
+        headers = {"alg": "HS256", "typ": "JWT"}
+        payload = {
+            "iss": self.access_key,
+            "exp": now + KLING_TOKEN_EXPIRE,
+            "nbf": now - 5,
+        }
+        return jwt.encode(payload, self.secret_key, headers=headers)
+
+    def _get_headers(self):
+        return {
+            "Authorization": f"Bearer {self._generate_jwt_token()}",
+            "Content-Type": "application/json",
+        }
+
+    def _check_response(self, response, action):
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Kling API {action} failed (HTTP {response.status_code}): "
+                f"{response.text[:500]}"
+            )
+        result = response.json()
+        if result.get("code") != 0:
+            raise RuntimeError(
+                f"Kling API {action} failed (code {result.get('code')}): "
+                f"{result.get('message', 'unknown error')}"
+            )
+        return result
+
+    def create_task(self, image_start_b64, image_end_b64=None, prompt="",
+                    model_name=KLING_DEFAULT_MODEL, duration=KLING_DEFAULT_DURATION,
+                    mode=KLING_DEFAULT_MODE, negative_prompt=""):
+        """Submit image-to-video generation task. Returns dict with task_id."""
+        import requests as req
+
+        body = {
+            "model_name": model_name,
+            "image": image_start_b64,
+            "duration": duration,
+            "mode": mode,
+        }
+        if image_end_b64:
+            body["image_tail"] = image_end_b64
+        if prompt:
+            body["prompt"] = prompt
+        if negative_prompt:
+            body["negative_prompt"] = negative_prompt
+        if not model_name.startswith("kling-v2"):
+            body["cfg_scale"] = 0.5
+
+        url = f"{KLING_API_BASE_URL}{KLING_CREATE_TASK}"
+        resp = req.post(url, json=body, headers=self._get_headers(), timeout=30)
+        result = self._check_response(resp, "create task")
+        task_data = result["data"]
+        print(f"    Task created: {task_data['task_id']} (status: {task_data['task_status']})")
+        return task_data
+
+    def query_task(self, task_id):
+        """Query task status. Returns task data dict."""
+        import requests as req
+
+        url = f"{KLING_API_BASE_URL}{KLING_QUERY_TASK.format(task_id=task_id)}"
+        resp = req.get(url, headers=self._get_headers(), timeout=30)
+        result = self._check_response(resp, "query task")
+        return result["data"]
+
+    def wait_for_task(self, task_id, timeout=KLING_DEFAULT_TIMEOUT,
+                      poll_interval=KLING_DEFAULT_POLL_INTERVAL):
+        """Poll until task completes. Returns task data with video URLs."""
+        start = time.time()
+        while True:
+            elapsed = int(time.time() - start)
+            if elapsed > timeout:
+                raise TimeoutError(f"Kling task {task_id} timed out after {elapsed}s")
+
+            task_data = self.query_task(task_id)
+            status = task_data["task_status"]
+
+            if status == "succeed":
+                print(f"    Task completed in {format_elapsed(elapsed)}")
+                return task_data
+            if status == "failed":
+                msg = task_data.get("task_status_msg", "unknown error")
+                raise RuntimeError(f"Kling task failed: {msg}")
+
+            print(f"    [{format_elapsed(elapsed)}] Status: {status}...")
+            time.sleep(poll_interval)
+
+    def download_video(self, video_url, save_path):
+        """Download generated video. Returns Path to saved file."""
+        import requests as req
+
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        resp = req.get(video_url, stream=True, timeout=60)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Download failed (HTTP {resp.status_code})")
+
+        with open(save_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+
+        size_mb = save_path.stat().st_size / (1024 * 1024)
+        print(f"    Downloaded: {save_path.name} ({size_mb:.1f} MB)")
+        return save_path
+
+
+def run_kling_job(kling_client, img_a, img_b, prompt, clip_path,
+                  model, duration, mode, negative_prompt, i2v_only,
+                  timeout, poll_interval):
+    """Run a single Kling image-to-video job.
+
+    Encodes images, submits task, polls for completion, downloads result.
+    Returns Path to generated video, or None on failure.
+    """
+    # Encode start frame as base64 (raw, no data: prefix)
+    with open(img_a, "rb") as f:
+        start_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    # Encode end frame (unless i2v-only mode)
+    end_b64 = None
+    if not i2v_only and img_b:
+        with open(img_b, "rb") as f:
+            end_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    video_type = "I2V (single frame)" if i2v_only else "FLF (first+last frame)"
+    print(f"    Kling {video_type}, model={model}, {duration}s, mode={mode}")
+
+    try:
+        task_data = kling_client.create_task(
+            image_start_b64=start_b64,
+            image_end_b64=end_b64,
+            prompt=prompt,
+            model_name=model,
+            duration=duration,
+            mode=mode,
+            negative_prompt=negative_prompt,
+        )
+
+        result_data = kling_client.wait_for_task(
+            task_data["task_id"],
+            timeout=timeout,
+            poll_interval=poll_interval,
+        )
+
+        videos = result_data.get("task_result", {}).get("videos", [])
+        if not videos:
+            print("    ERROR: Task completed but no video returned")
+            return None
+
+        video_url = videos[0]["url"]
+        return kling_client.download_video(video_url, clip_path)
+
+    except (RuntimeError, TimeoutError) as e:
+        print(f"    ERROR: {e}")
+        return None
+    except Exception as e:
+        print(f"    ERROR: Unexpected error: {e}")
+        return None
+
+
+def estimate_kling_duration(prompt, client):
+    """Ask GPT-4o to suggest 5 or 10 second duration for a Kling clip.
+
+    Returns string "5" or "10".
+    """
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{
+            "role": "user",
+            "content": (
+                f'Based on this video prompt, suggest the ideal clip duration.\n'
+                f'Choose either 5 or 10 seconds:\n'
+                f'- 5 seconds -- quick action, reaction, transition, or simple motion\n'
+                f'- 10 seconds -- extended action, dialogue scene, complex motion, or slow pan\n\n'
+                f'Prompt: "{prompt}"\n\n'
+                f'Return ONLY the number (5 or 10), nothing else.'
+            ),
+        }],
+        max_tokens=5,
+        temperature=0.3,
+    )
+
+    try:
+        dur = response.choices[0].message.content.strip()
+        if dur in KLING_VALID_DURATIONS:
+            return dur
+    except (ValueError, IndexError):
+        pass
+    return KLING_DEFAULT_DURATION
 
 
 # ============================================================
@@ -451,16 +702,21 @@ def print_progress_bar(current, total, width=30):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Generate video sequence from consecutive image pairs using Wan2GP",
+        description="Generate video sequence from consecutive image pairs (Wan2GP or Kling AI)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:
+  # Wan2GP (local GPU, default)
   python generation_research/generate_sequence.py --images-folder ./manga/0001/panels --prompt "anime style scene"
-  python generation_research/generate_sequence.py --images-folder ./frames --prompt "smooth transition" --flag
-  python generation_research/generate_sequence.py --images-folder ./frames --prompt "action" --resolution 720p --model-type flf2v
+  python generation_research/generate_sequence.py --images-folder ./frames --prompt "smooth transition" --aiprompt
+
+  # Kling AI (cloud API)
+  python generation_research/generate_sequence.py --backend kling --images-folder ./frames --prompt "anime scene"
+  python generation_research/generate_sequence.py --backend kling --images-folder ./frames --prompt "action" --aiprompt --mode pro --duration 10
 """,
     )
 
+    # ---- Shared arguments ----
     parser.add_argument(
         "--images-folder", required=True,
         help="Path to folder containing input images (sorted alphabetically)",
@@ -474,14 +730,31 @@ examples:
         help="Output directory (default: output/generation/<timestamp>)",
     )
     parser.add_argument(
-        "--flag", action="store_true",
+        "--aiprompt", action="store_true",
         help="Use GPT-4o to generate detailed AI prompts from each image + base prompt",
     )
+    # Hidden backward compat alias for --flag
+    parser.add_argument("--flag", action="store_true", dest="aiprompt", help=argparse.SUPPRESS)
     parser.add_argument(
+        "--resume", action="store_true",
+        help="Skip already-generated clips (resume interrupted run)",
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=None,
+        help="Timeout per clip in seconds (default: 1800 wan2gp, 600 kling)",
+    )
+    parser.add_argument(
+        "--backend", default="wan2gp", choices=["wan2gp", "kling"],
+        help="Video generation backend (default: wan2gp)",
+    )
+
+    # ---- Wan2GP-specific arguments ----
+    wan2gp_group = parser.add_argument_group("Wan2GP options (--backend wan2gp)")
+    wan2gp_group.add_argument(
         "--resolution", choices=["480p", "720p"], default="480p",
         help="Video resolution (default: 480p, recommended for 11GB VRAM)",
     )
-    parser.add_argument(
+    wan2gp_group.add_argument(
         "--model-type", default="fun_inp_1.3B",
         choices=["fun_inp_1.3B", "i2v", "flf2v"],
         help=(
@@ -491,55 +764,78 @@ examples:
             "flf2v = First-Last-Frame 720p 14B (needs 24GB+)"
         ),
     )
-    parser.add_argument(
+    wan2gp_group.add_argument(
         "--frames", type=int, default=49,
         help="Number of frames per clip (default: 49 = ~2s at 24fps). Must be 4n+1.",
     )
-    parser.add_argument(
+    wan2gp_group.add_argument(
         "--steps", type=int, default=30,
         help="Number of inference steps (default: 30)",
     )
-    parser.add_argument(
+    wan2gp_group.add_argument(
         "--profile", type=int, default=4, choices=[1, 2, 3, 4, 5],
         help="Wan2GP memory profile (default: 4, load parts on demand)",
     )
-    parser.add_argument(
+    wan2gp_group.add_argument(
         "--attention", default="sdpa", choices=["sdpa", "sage", "flash", "sage2"],
         help="Attention mode (default: sdpa, safest for RTX 20XX)",
     )
-    parser.add_argument(
+    wan2gp_group.add_argument(
         "--wan2gp-dir", default=None,
         help="Path to Wan2GP installation (default: sibling wan2gp/ directory)",
     )
-    parser.add_argument(
+    wan2gp_group.add_argument(
         "--wan2gp-env", default="wan2gp",
         help="Conda environment name for Wan2GP (default: wan2gp)",
     )
-    parser.add_argument(
+    wan2gp_group.add_argument(
         "--seed", type=int, default=42,
         help="Random seed for reproducibility (default: 42, -1 for random)",
     )
-    parser.add_argument(
+    wan2gp_group.add_argument(
         "--guidance-scale", type=float, default=5.0,
         help="Guidance scale (default: 5.0)",
     )
-    parser.add_argument(
+    wan2gp_group.add_argument(
         "--settings-template", default=None,
         help="Path to exported Wan2GP settings JSON to use as base template",
     )
-    parser.add_argument(
-        "--resume", action="store_true",
-        help="Skip already-generated clips (resume interrupted run)",
+
+    # ---- Kling-specific arguments ----
+    kling_group = parser.add_argument_group("Kling options (--backend kling)")
+    kling_group.add_argument(
+        "--model", default=KLING_DEFAULT_MODEL,
+        help=f"Kling model name (default: {KLING_DEFAULT_MODEL})",
     )
-    parser.add_argument(
-        "--timeout", type=int, default=1800,
-        help="Timeout per clip in seconds (default: 1800 = 30 min)",
+    kling_group.add_argument(
+        "--duration", default=KLING_DEFAULT_DURATION, choices=KLING_VALID_DURATIONS,
+        help=f"Clip duration in seconds (default: {KLING_DEFAULT_DURATION})",
+    )
+    kling_group.add_argument(
+        "--mode", default=KLING_DEFAULT_MODE, choices=["std", "pro"],
+        help=f"Generation mode: std (fast) or pro (higher quality) (default: {KLING_DEFAULT_MODE})",
+    )
+    kling_group.add_argument(
+        "--negative-prompt", default="",
+        help="Negative prompt (elements to avoid in generation)",
+    )
+    kling_group.add_argument(
+        "--i2v-only", action="store_true",
+        help="Use only start frame (no end frame), single-image I2V",
+    )
+    kling_group.add_argument(
+        "--poll-interval", type=int, default=KLING_DEFAULT_POLL_INTERVAL,
+        help=f"Seconds between status polls (default: {KLING_DEFAULT_POLL_INTERVAL})",
     )
 
     args = parser.parse_args()
 
-    # Validate frame count
-    if args.frames not in VALID_FRAME_COUNTS:
+    # Set backend-appropriate default timeout
+    if args.timeout is None:
+        args.timeout = 600 if args.backend == "kling" else 1800
+
+    # Validate frame count (Wan2GP only)
+    if args.backend == "wan2gp" and args.frames not in VALID_FRAME_COUNTS:
         closest = min(VALID_FRAME_COUNTS, key=lambda x: abs(x - args.frames))
         print(f"  WARNING: --frames {args.frames} is not valid (must be 4n+1). Using {closest}.")
         args.frames = closest
@@ -554,22 +850,36 @@ examples:
 def main():
     args = parse_args()
     run_start = time.time()
+    is_kling = args.backend == "kling"
 
     # Resolve paths
     images_folder = Path(args.images_folder)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     output_folder = Path(args.output_folder or f"output/generation/{timestamp}")
 
-    # Locate Wan2GP
-    wan2gp_dir = find_wan2gp_dir(args.wan2gp_dir)
+    # ---- Backend-specific init ----
+    wan2gp_dir = None
+    resolution = None
+    kling_client = None
 
-    # Resolve resolution string
-    resolution = RESOLUTION_PRESETS.get(args.resolution, args.resolution)
-    if args.model_type == "flf2v" and args.resolution != "720p":
-        print("  NOTE: FLF2V model is 720p only. Overriding resolution to 720p.")
-        resolution = "1280x720"
-    if args.model_type in ("i2v", "flf2v"):
-        print("  WARNING: 14B models need 24GB+ VRAM. Use fun_inp_1.3B for 11GB GPUs.")
+    if is_kling:
+        # Validate Kling dependencies
+        try:
+            import jwt      # noqa: F401
+            import requests  # noqa: F401
+        except ImportError as e:
+            print(f"  ERROR: Missing dependency for Kling backend: {e}")
+            print("  Install with: pip install pyjwt requests")
+            return
+        kling_client = KlingClient()
+    else:
+        wan2gp_dir = find_wan2gp_dir(args.wan2gp_dir)
+        resolution = RESOLUTION_PRESETS.get(args.resolution, args.resolution)
+        if args.model_type == "flf2v" and args.resolution != "720p":
+            print("  NOTE: FLF2V model is 720p only. Overriding resolution to 720p.")
+            resolution = "1280x720"
+        if args.model_type in ("i2v", "flf2v"):
+            print("  WARNING: 14B models need 24GB+ VRAM. Use fun_inp_1.3B for 11GB GPUs.")
 
     # Create output directories
     output_folder.mkdir(parents=True, exist_ok=True)
@@ -578,19 +888,31 @@ def main():
     settings_dir = output_folder / "settings"
     settings_dir.mkdir(exist_ok=True)
 
+    # ---- Print config banner ----
     print("=" * 60)
     print("  Image Sequence Video Generation Pipeline")
     print("=" * 60)
+    print(f"  Backend:     {args.backend}")
     print(f"  Images:      {images_folder}")
-    print(f"  Model:       {args.model_type} ({MODEL_ARCHITECTURES[args.model_type]})")
-    print(f"  Resolution:  {resolution}")
-    print(f"  Frames:      {args.frames} (~{args.frames / 24:.1f}s at 24fps)")
-    print(f"  Steps:       {args.steps}")
-    print(f"  Profile:     {args.profile}")
-    print(f"  Attention:   {args.attention}")
-    print(f"  AI Prompt:   {'YES (GPT-4o)' if args.flag else 'no'}")
-    print(f"  Seed:        {args.seed}")
-    print(f"  Wan2GP:      {wan2gp_dir}")
+    if is_kling:
+        print(f"  Model:       {args.model}")
+        print(f"  Duration:    {args.duration}s")
+        print(f"  Mode:        {args.mode}")
+        flt_mode = "I2V (single frame)" if args.i2v_only else "FLF (first+last frame)"
+        print(f"  Frame mode:  {flt_mode}")
+        if args.negative_prompt:
+            print(f"  Neg. prompt: {args.negative_prompt}")
+    else:
+        print(f"  Model:       {args.model_type} ({MODEL_ARCHITECTURES[args.model_type]})")
+        print(f"  Resolution:  {resolution}")
+        print(f"  Frames:      {args.frames} (~{args.frames / 24:.1f}s at 24fps)")
+        print(f"  Steps:       {args.steps}")
+        print(f"  Profile:     {args.profile}")
+        print(f"  Attention:   {args.attention}")
+        print(f"  Seed:        {args.seed}")
+        print(f"  Wan2GP:      {wan2gp_dir}")
+    print(f"  AI Prompt:   {'YES (GPT-4o)' if args.aiprompt else 'no'}")
+    print(f"  Timeout:     {args.timeout}s")
     print(f"  Output:      {output_folder}")
     print(f"  Resume:      {'yes' if args.resume else 'no'}")
     print("=" * 60)
@@ -603,36 +925,37 @@ def main():
     for i, img in enumerate(images):
         print(f"    {i + 1}. {img.name}")
 
-    # ---- Setup OpenAI client if --flag ----
-    client = None
-    if args.flag:
+    # ---- Setup OpenAI client if --aiprompt ----
+    openai_client = None
+    if args.aiprompt:
         try:
             from openai import OpenAI
-            client = OpenAI()
+            openai_client = OpenAI()
             print("  OpenAI client initialized for AI prompting")
         except ImportError:
-            print("  ERROR: --flag requires 'openai' package. pip install openai")
+            print("  ERROR: --aiprompt requires 'openai' package. pip install openai")
             return
         except Exception as e:
             print(f"  ERROR: Failed to initialize OpenAI client: {e}")
             print("  Make sure OPENAI_API_KEY is set.")
             return
 
-    # ---- Load settings template ----
+    # ---- Load settings template (Wan2GP only) ----
     template = None
-    if args.settings_template:
-        tpl_path = Path(args.settings_template)
-        if not tpl_path.exists():
-            print(f"  ERROR: Settings template not found: {tpl_path}")
-            return
-        with open(tpl_path, encoding="utf-8") as f:
-            template = json.load(f)
-        print(f"  Loaded settings template: {tpl_path.name}")
-    else:
-        template = load_default_settings()
-        print("  Using default settings (no template provided)")
-        print("  TIP: Export a settings JSON from the Wan2GP UI for best results.")
-        print("       Use --settings-template <path> to load it.")
+    if not is_kling:
+        if args.settings_template:
+            tpl_path = Path(args.settings_template)
+            if not tpl_path.exists():
+                print(f"  ERROR: Settings template not found: {tpl_path}")
+                return
+            with open(tpl_path, encoding="utf-8") as f:
+                template = json.load(f)
+            print(f"  Loaded settings template: {tpl_path.name}")
+        else:
+            template = load_default_settings()
+            print("  Using default settings (no template provided)")
+            print("  TIP: Export a settings JSON from the Wan2GP UI for best results.")
+            print("       Use --settings-template <path> to load it.")
 
     # ---- [2/4] Generate clips ----
     print(f"\n[2/4] Generating {len(pairs)} video clips...")
@@ -655,51 +978,91 @@ def main():
         # Generate prompt via GPT-4o or use base prompt
         prompt = args.prompt
         frames = args.frames
-        if args.flag and client:
+        duration = args.duration if is_kling else None
+
+        if args.aiprompt and openai_client:
             print("    Generating AI prompt via GPT-4o...")
             try:
-                prompt = generate_ai_prompt(img_a, args.prompt, client)
-                frames = estimate_duration(prompt, client)
-                print(f"    AI prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}")
-                print(f"    AI duration: {frames} frames ({frames / 24:.1f}s)")
+                prompt = generate_ai_prompt(img_a, args.prompt, openai_client,
+                                            backend=args.backend)
+                print(f"    [AI Prompt] {prompt}")
+                if is_kling:
+                    duration = estimate_kling_duration(prompt, openai_client)
+                    print(f"    [AI Duration] {duration}s")
+                else:
+                    frames = estimate_duration(prompt, openai_client)
+                    print(f"    [AI Duration] {frames} frames ({frames / 24:.1f}s)")
             except Exception as e:
                 print(f"    WARNING: AI prompt failed ({e}), using base prompt")
                 prompt = args.prompt
                 frames = args.frames
+                duration = args.duration if is_kling else None
 
-        # Build settings JSON
-        settings = build_wan2gp_settings(
-            template_settings=template,
-            prompt=prompt,
-            first_frame_path=img_a.resolve(),
-            last_frame_path=img_b.resolve(),
-            output_filename=clip_path.stem,
-            frames=frames,
-            resolution=resolution,
-            model_type=args.model_type,
-            seed=args.seed if args.seed != -1 else -1,
-            guidance_scale=args.guidance_scale,
-            steps=args.steps,
-        )
-
-        # Write settings to file
-        settings_path = settings_dir / f"settings_{idx + 1:03d}.json"
-        with open(settings_path, "w", encoding="utf-8") as f:
-            json.dump(settings, f, indent=2, ensure_ascii=False)
-
-        # Run Wan2GP
-        print(f"    Running Wan2GP (profile {args.profile}, {resolution})...")
         clip_start = time.time()
 
-        result_path = run_wan2gp_job(
-            settings_path=settings_path,
-            output_dir=str(clips_dir),
-            wan2gp_dir=str(wan2gp_dir),
-            conda_env=args.wan2gp_env,
-            profile=args.profile,
-            attention=args.attention,
-            timeout=args.timeout,
-        )
+        if is_kling:
+            # ---- Kling backend ----
+            # Save job metadata (without base64 images)
+            job_meta = {
+                "backend": "kling",
+                "model": args.model,
+                "duration": duration,
+                "mode": args.mode,
+                "prompt": prompt,
+                "negative_prompt": args.negative_prompt,
+                "i2v_only": args.i2v_only,
+                "image_start": str(img_a),
+                "image_end": str(img_b) if not args.i2v_only else None,
+            }
+            meta_path = settings_dir / f"job_{idx + 1:03d}.json"
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(job_meta, f, indent=2, ensure_ascii=False)
+
+            result_path = run_kling_job(
+                kling_client=kling_client,
+                img_a=img_a,
+                img_b=img_b,
+                prompt=prompt,
+                clip_path=clip_path,
+                model=args.model,
+                duration=duration,
+                mode=args.mode,
+                negative_prompt=args.negative_prompt,
+                i2v_only=args.i2v_only,
+                timeout=args.timeout,
+                poll_interval=args.poll_interval,
+            )
+        else:
+            # ---- Wan2GP backend ----
+            settings = build_wan2gp_settings(
+                template_settings=template,
+                prompt=prompt,
+                first_frame_path=img_a.resolve(),
+                last_frame_path=img_b.resolve(),
+                output_filename=clip_path.stem,
+                frames=frames,
+                resolution=resolution,
+                model_type=args.model_type,
+                seed=args.seed if args.seed != -1 else -1,
+                guidance_scale=args.guidance_scale,
+                steps=args.steps,
+            )
+
+            settings_path = settings_dir / f"settings_{idx + 1:03d}.json"
+            with open(settings_path, "w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=2, ensure_ascii=False)
+
+            print(f"    Running Wan2GP (profile {args.profile}, {resolution})...")
+
+            result_path = run_wan2gp_job(
+                settings_path=settings_path,
+                output_dir=str(clips_dir),
+                wan2gp_dir=str(wan2gp_dir),
+                conda_env=args.wan2gp_env,
+                profile=args.profile,
+                attention=args.attention,
+                timeout=args.timeout,
+            )
 
         clip_elapsed = time.time() - clip_start
 
@@ -710,7 +1073,7 @@ def main():
                 try:
                     shutil.move(str(result_path), str(clip_path))
                 except Exception:
-                    clip_path = result_path  # use whatever name Wan2GP gave
+                    clip_path = result_path  # use whatever name backend gave
 
             clip_paths.append(clip_path)
             print(f"    Done in {format_elapsed(clip_elapsed)} -> {clip_path.name}")
@@ -733,7 +1096,10 @@ def main():
 
     if not clip_paths:
         print("\n  No clips generated. Cannot concatenate.")
-        print("  Check Wan2GP installation and settings.")
+        if is_kling:
+            print("  Check KLING_ACCESS_KEY/KLING_SECRET_KEY and API credits.")
+        else:
+            print("  Check Wan2GP installation and settings.")
         return
 
     # ---- [4/4] Concatenate ----

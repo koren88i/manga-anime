@@ -147,6 +147,17 @@ def api_analyze_frame(episode_id):
     return jsonify(result)
 
 
+@app.route("/api/episode/<episode_id>/scene_at_time", methods=["POST"])
+def api_scene_at_time(episode_id):
+    """Return full VLM scene data at a given timestamp."""
+    body = request.get_json()
+    time_sec = body.get("time_sec", 0)
+    scene = backend.get_full_scene_at_time(episode_id, time_sec)
+    if scene:
+        return jsonify(scene)
+    return jsonify({})
+
+
 # ---- Tags ----
 @app.route("/api/episode/<episode_id>/tags")
 def api_get_tags(episode_id):
@@ -163,6 +174,7 @@ def api_create_tag(episode_id):
         end_sec=body["end_sec"],
         subtitle_text=body.get("subtitle_text", ""),
         face_cluster_id=body.get("face_cluster_id"),
+        confidence=body.get("confidence", "manual"),
     )
     return jsonify(tag)
 
@@ -253,8 +265,66 @@ def api_speaker_recommendation(episode_id):
     return jsonify({
         "character": best[0][0],
         "confidence": round(best[0][1] / total, 2) if total > 0 else 0,
-        "candidates": [{"name": n, "score": round(s, 1)} for n, s in best],
+        "total_overlap_sec": round(total, 1),
+        "candidates": [{"name": n, "score": round(s, 1), "pct": round(s / total * 100, 1) if total > 0 else 0} for n, s in best],
     })
+
+
+@app.route("/api/episode/<episode_id>/enriched_subtitles")
+def api_enriched_subtitles(episode_id):
+    enriched = backend.get_enriched_subtitles(episode_id)
+    return jsonify(enriched)
+
+
+@app.route("/api/episode/<episode_id>/bulk_accept", methods=["POST"])
+def api_bulk_accept(episode_id):
+    body = request.get_json()
+    accepts = body.get("accepts", [])
+    count = backend.bulk_accept_tags(episode_id, accepts)
+    return jsonify({"ok": True, "accepted": count})
+
+
+@app.route("/api/episode/<episode_id>/dismiss_recommendation", methods=["POST"])
+def api_dismiss_recommendation(episode_id):
+    body = request.get_json()
+    backend.dismiss_recommendation(
+        episode_id, body["start_sec"], body["end_sec"], body["character"]
+    )
+    return jsonify({"ok": True})
+
+
+# ---- Diarization ----
+@app.route("/api/episode/<episode_id>/diarization_groups")
+def api_diarization_groups(episode_id):
+    data = backend.get_diarization_status(episode_id)
+    return jsonify(data)
+
+
+@app.route("/api/episode/<episode_id>/diarization_run", methods=["POST"])
+def api_diarization_run(episode_id):
+    try:
+        from voice.diarize_segments import diarize_episode
+    except ImportError as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    job_id = backend.start_job(diarize_episode, episode_id)
+    return jsonify({"ok": True, "job_id": job_id})
+
+
+@app.route("/api/episode/<episode_id>/diarization_status")
+def api_diarization_job_status(episode_id):
+    job_id = request.args.get("job_id")
+    if job_id:
+        return jsonify(backend.get_job_status(job_id))
+    data = backend.get_diarization_status(episode_id)
+    return jsonify({"status": data.get("status", "not_found")})
+
+
+@app.route("/api/episode/<episode_id>/diarization_accept", methods=["POST"])
+def api_diarization_accept(episode_id):
+    body = request.get_json()
+    accepts = body.get("accepts", [])
+    count = backend.bulk_accept_diarization(episode_id, accepts)
+    return jsonify({"ok": True, "tagged": count})
 
 
 # ---- Recommendations ----
@@ -326,283 +396,343 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Voice Tagger</title>
+<title>Voice Tagger — Triage Mode</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f0f0f; color: #e0e0e0; }
+body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f0f0f; color: #e0e0e0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 
-/* Top bar */
+/* ── Top bar ── */
 .topbar {
-    display: flex; align-items: center; gap: 12px;
-    padding: 8px 16px; background: #1a1a2e; border-bottom: 1px solid #333;
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 16px; background: #1a1a2e; border-bottom: 1px solid #333;
+    flex-shrink: 0; flex-wrap: wrap;
 }
-.topbar select { background: #252540; color: #fff; border: 1px solid #444; padding: 6px 10px; border-radius: 4px; }
-.topbar button { background: #3a3a5c; color: #fff; border: none; padding: 6px 14px; border-radius: 4px; cursor: pointer; }
-.topbar button:hover { background: #4a4a7c; }
-.topbar .status { color: #888; font-size: 13px; margin-left: auto; }
+.topbar select { background: #252540; color: #fff; border: 1px solid #444; padding: 5px 10px; border-radius: 4px; font-size: 13px; }
+.topbar .status { color: #888; font-size: 12px; margin-left: auto; }
 
-/* Main layout */
-.main { display: flex; height: calc(100vh - 42px - 200px - 240px); min-height: 300px; }
+/* ── Progress bar ── */
+.progress-row {
+    display: flex; align-items: center; gap: 8px; flex: 1; min-width: 200px;
+}
+.progress-outer {
+    flex: 1; height: 8px; background: #333; border-radius: 4px; overflow: hidden;
+}
+.progress-inner { height: 100%; border-radius: 4px; transition: width 0.3s, background 0.3s; }
+.progress-text { font-size: 11px; color: #aaa; white-space: nowrap; }
+.tier-counts { font-size: 11px; color: #888; white-space: nowrap; }
+.tier-counts .t1 { color: #4caf50; } .tier-counts .t2 { color: #ffc107; } .tier-counts .t3 { color: #f44; }
 
-/* Video panel */
-.video-panel { flex: 1; position: relative; background: #000; display: flex; align-items: center; justify-content: center; }
-.video-panel video { max-width: 100%; max-height: 100%; }
-.video-panel canvas { position: absolute; top: 0; left: 0; pointer-events: none; }
+/* ── Toolbar buttons ── */
+.tb-btn {
+    background: #3a3a5c; color: #fff; border: none; padding: 5px 12px;
+    border-radius: 4px; cursor: pointer; font-size: 12px; white-space: nowrap;
+}
+.tb-btn:hover { background: #4a4a7c; }
+.tb-btn.active { background: #6a4aac; }
+.tb-btn.accept-all { background: #2a6a2a; font-weight: 700; }
+.tb-btn.accept-all:hover { background: #3a8a3a; }
+.tb-btn.accept-scene { background: #2a5a3a; }
+.tb-btn.accept-scene:hover { background: #3a7a4a; }
+.filter-group { display: flex; gap: 2px; }
+.filter-group .tb-btn { border-radius: 0; }
+.filter-group .tb-btn:first-child { border-radius: 4px 0 0 4px; }
+.filter-group .tb-btn:last-child { border-radius: 0 4px 4px 0; }
+
+/* ── Main layout ── */
+.main { display: flex; flex: 1; min-height: 0; overflow: hidden; }
+
+/* ── Scene panel (toggleable) ── */
+.scene-panel {
+    width: 280px; background: #0d0d1a; border-right: 1px solid #333;
+    overflow-y: auto; padding: 10px 12px; font-size: 12px;
+    flex-shrink: 0; display: none;
+}
+.scene-panel.visible { display: block; }
+.scene-panel h3 { font-size: 11px; color: #666; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 1px; }
+.scene-badge { padding: 2px 8px; border-radius: 3px; font-size: 10px; font-weight: 700; text-transform: uppercase; }
+.scene-badge.story { background: #2a3a5a; color: #8af; }
+.scene-badge.flashback { background: #5a3a2a; color: #fa8; }
+.scene-badge.opening { background: #2a5a3a; color: #8fa; }
+.scene-badge.ending { background: #5a2a5a; color: #f8f; }
+.scene-badge.recap { background: #5a5a2a; color: #cc8; }
+.scene-badge.transition { background: #3a3a3a; color: #aaa; }
+.scene-badge.eyecatch { background: #5a3a5a; color: #c8f; }
+.scene-narrative { color: #aaa; font-style: italic; line-height: 1.4; margin: 6px 0; border-left: 2px solid #444; padding-left: 8px; font-size: 11px; }
+.scene-char { padding: 3px 6px; margin-bottom: 2px; border-radius: 3px; background: #1a1a2a; font-size: 11px; }
+.scene-char-name { font-weight: 700; }
+.te-item { padding: 4px 8px; margin-bottom: 2px; border-radius: 3px; background: #111122; border-left: 3px solid #444; cursor: pointer; font-size: 11px; }
+.te-item:hover { background: #1a1a2e; }
+.te-item.te-active { background: #1a1a3e; }
+
+/* ── Video panel ── */
+.video-panel {
+    position: relative; background: #000; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; min-width: 280px;
+    width: 30%; flex-shrink: 0;
+}
+.video-panel video { max-width: 100%; max-height: calc(100% - 44px); }
 .video-controls {
-    position: absolute; bottom: 0; left: 0; right: 0;
-    background: rgba(0,0,0,0.8); padding: 8px 12px;
-    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    width: 100%; background: rgba(0,0,0,0.85); padding: 6px 10px;
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap; flex-shrink: 0;
 }
 .video-controls button {
-    background: #3a3a5c; color: #fff; border: none; padding: 4px 10px;
-    border-radius: 3px; cursor: pointer; font-size: 12px;
+    background: #3a3a5c; color: #fff; border: none; padding: 3px 8px;
+    border-radius: 3px; cursor: pointer; font-size: 11px;
 }
 .video-controls button:hover { background: #5a5a8c; }
-.video-controls button.active { background: #6a4aac; }
-.video-controls .time-display { color: #aaa; font-size: 12px; font-family: monospace; }
-.selection-display { color: #ffcc00; font-size: 12px; font-family: monospace; }
+.video-controls .time-display { color: #aaa; font-size: 11px; font-family: monospace; }
 
-/* Character panel */
+/* ── Subtitle list (main work area) ── */
+.sub-list-panel {
+    flex: 1; overflow-y: auto; background: #111; min-width: 300px;
+}
+.scene-group { border-bottom: 1px solid #222; }
+.scene-group-header {
+    display: flex; align-items: center; gap: 8px; padding: 6px 12px;
+    background: #1a1a1a; cursor: pointer; user-select: none;
+    position: sticky; top: 0; z-index: 5; flex-wrap: wrap;
+}
+.scene-group-header:hover { background: #222; }
+.sg-title { font-weight: 700; font-size: 12px; }
+.sg-badge { font-size: 10px; padding: 1px 6px; border-radius: 3px; font-weight: 600; }
+.sg-location { color: #8af; font-size: 11px; }
+.sg-chars { display: flex; gap: 4px; flex-wrap: wrap; }
+.sg-char-chip { font-size: 10px; padding: 1px 6px; border-radius: 10px; border: 1px solid #444; }
+.sg-progress { margin-left: auto; font-size: 11px; color: #888; white-space: nowrap; }
+.sg-done { color: #4caf50; }
+.scene-group-body { }
+.scene-group.collapsed .scene-group-body { display: none; }
+
+/* ── Subtitle row ── */
+.sub-row {
+    display: flex; align-items: flex-start; gap: 8px; padding: 5px 12px;
+    border-left: 3px solid #333; cursor: pointer; transition: background 0.1s;
+    min-height: 32px;
+}
+.sub-row:hover { background: #1a1a1a; }
+.sub-row.focused { background: #1a1a2e; outline: 1px solid #6a4aac; outline-offset: -1px; }
+.sub-row.tagged { border-left-color: #4caf50; }
+.sub-row.tier1 { border-left-color: #ffc107; }
+.sub-row.tier2 { border-left-color: #ff9800; }
+.sub-row.tier3 { border-left-color: #666; }
+.sub-row .sr-time { font-family: monospace; font-size: 11px; color: #888; min-width: 42px; flex-shrink: 0; padding-top: 1px; }
+.sub-row .sr-text { flex: 1; font-size: 12px; line-height: 1.4; min-width: 0; }
+.sub-row .sr-signal { display: flex; align-items: center; gap: 6px; flex-shrink: 0; flex-wrap: wrap; }
+.sr-suggestion {
+    display: flex; align-items: center; gap: 4px; font-size: 11px;
+    padding: 2px 8px; border-radius: 3px; background: #1a1a2e;
+}
+.sr-char-name { font-weight: 700; }
+.sr-score { color: #888; font-size: 10px; }
+.sr-reason { color: #666; font-size: 10px; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sr-actions { display: flex; gap: 3px; }
+.sr-btn {
+    font-size: 10px; padding: 2px 7px; border: none; border-radius: 3px;
+    cursor: pointer; font-weight: 600;
+}
+.sr-accept { background: #2a5a2a; color: #cfc; }
+.sr-accept:hover { background: #3a7a3a; }
+.sr-change { background: #3a3a5c; color: #ccf; }
+.sr-change:hover { background: #4a4a7c; }
+.sr-tag-badge {
+    display: flex; align-items: center; gap: 4px; font-size: 11px;
+    padding: 2px 8px; border-radius: 3px; background: #1a3a1a;
+}
+.sr-tag-badge .sr-del { color: #c44; cursor: pointer; font-size: 13px; }
+.sr-tag-badge .sr-del:hover { color: #f66; }
+.sr-unresolved-chips { display: flex; gap: 3px; flex-wrap: wrap; }
+.sr-chip {
+    font-size: 10px; padding: 2px 8px; border-radius: 10px;
+    border: 1px solid #444; cursor: pointer; font-weight: 600; white-space: nowrap;
+}
+.sr-chip:hover { background: #2a2a4e; border-color: #6a4aac; }
+
+/* ── Inline character picker ── */
+.char-picker {
+    padding: 6px 12px 8px 62px; background: #151520; border-left: 3px solid #6a4aac;
+    display: none;
+}
+.char-picker.open { display: block; }
+.cp-section-label { font-size: 10px; color: #555; margin: 4px 0 2px; text-transform: uppercase; }
+.cp-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 4px; }
+.cp-chip {
+    font-size: 11px; padding: 3px 10px; border-radius: 12px;
+    border: 1px solid #444; cursor: pointer; font-weight: 600;
+}
+.cp-chip:hover { background: #2a2a4e; border-color: #6a4aac; }
+.cp-search {
+    width: 200px; padding: 4px 8px; background: #222; color: #eee;
+    border: 1px solid #444; border-radius: 4px; font-size: 12px; outline: none;
+    margin-top: 4px;
+}
+.cp-search:focus { border-color: #6a4aac; }
+.cp-all-chars { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; max-height: 80px; overflow-y: auto; }
+
+/* ── Character panel (toggleable) ── */
 .char-panel {
-    width: 280px; background: #1a1a1a; border-left: 1px solid #333;
-    overflow-y: auto; padding: 8px;
+    width: 260px; background: #1a1a1a; border-left: 1px solid #333;
+    overflow-y: auto; padding: 8px; flex-shrink: 0; display: none;
 }
-.char-panel h3 { font-size: 13px; color: #888; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
-.recent-chars { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; min-height: 26px; }
-.recent-chip {
-    padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 600;
-    cursor: pointer; border: 1px solid #444; background: #1a1a2e; white-space: nowrap;
-    transition: background 0.15s;
-}
-.recent-chip:hover { background: #2a2a4e; }
-.recent-chip.selected { border-color: #6a4aac; background: #2a1a4e; }
-.char-search {
-    width: 100%; box-sizing: border-box; padding: 6px 8px; margin-bottom: 8px;
-    background: #222; color: #eee; border: 1px solid #444; border-radius: 4px;
-    font-size: 13px; outline: none;
-}
-.char-search:focus { border-color: #6a4aac; }
+.char-panel.visible { display: block; }
+.char-panel h3 { font-size: 11px; color: #666; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 1px; }
 .char-item {
-    padding: 6px 8px; margin-bottom: 4px; border-radius: 4px;
-    cursor: pointer; display: flex; align-items: center; gap: 8px;
-    border: 1px solid transparent;
+    padding: 5px 8px; margin-bottom: 3px; border-radius: 4px;
+    cursor: pointer; display: flex; align-items: center; gap: 6px;
+    border: 1px solid transparent; font-size: 12px;
 }
 .char-item:hover { background: #252525; }
-.char-item.selected { border-color: #6a4aac; background: #1a1a2e; }
-.char-item.ready { border-color: #2a6a2a; }
-.char-item .char-thumb { width: 32px; height: 32px; border-radius: 4px; object-fit: cover; background: #333; }
+.char-item .char-thumb { width: 28px; height: 28px; border-radius: 3px; object-fit: cover; background: #333; }
 .char-item .char-info { flex: 1; min-width: 0; }
-.char-item .char-name { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.char-item .char-progress { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
-.char-item .progress-bar { flex: 1; height: 4px; background: #333; border-radius: 2px; overflow: hidden; }
-.char-item .progress-fill { height: 100%; border-radius: 2px; transition: width 0.3s; }
-.char-item .progress-text { font-size: 10px; color: #888; white-space: nowrap; }
-.char-actions { margin-top: 12px; }
-.char-actions button {
-    width: 100%; padding: 8px; margin-bottom: 6px;
-    background: #3a3a5c; color: #fff; border: none; border-radius: 4px; cursor: pointer;
-}
-.char-actions button:hover { background: #5a5a8c; }
-.char-actions button.clone-btn { background: #2a5a2a; }
-.char-actions button.clone-btn:hover { background: #3a7a3a; }
+.char-item .char-name { font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.char-item .progress-bar { height: 3px; background: #333; border-radius: 2px; overflow: hidden; margin-top: 2px; }
+.char-item .progress-fill { height: 100%; border-radius: 2px; }
+.char-item .progress-text { font-size: 9px; color: #888; }
 
-/* Subtitle strip */
-.sub-strip {
-    height: 200px; background: #111; border-top: 1px solid #333;
-    overflow-x: auto; overflow-y: hidden; position: relative;
-    white-space: nowrap;
+/* ── Footer ── */
+.footer {
+    display: flex; align-items: center; gap: 16px;
+    padding: 4px 16px; background: #1a1a2e; border-top: 1px solid #333;
+    font-size: 11px; color: #888; flex-shrink: 0;
 }
-.sub-strip-inner { position: relative; height: 100%; padding: 8px 0; }
-.sub-strip-header {
-    display: flex; align-items: center; gap: 8px;
-    padding: 4px 12px; background: #1a1a1a; border-top: 1px solid #333;
-    font-size: 12px; color: #888;
-}
-.sub-block {
-    display: inline-block; vertical-align: top;
-    margin: 4px 2px; padding: 6px 8px;
-    border-radius: 4px; cursor: pointer;
-    font-size: 11px; line-height: 1.3;
-    max-width: 200px; white-space: normal;
-    border: 2px solid transparent;
-    min-height: 50px;
-    overflow: hidden;
-}
-.sub-block:hover { opacity: 0.9; }
-.sub-block.untagged { background: #252525; color: #999; }
-.sub-block.tagged { color: #fff; }
-.sub-block.suggested { border-style: dashed; }
-.sub-block.current { box-shadow: 0 0 0 2px #fff; }
-.sub-block .sub-time { font-size: 9px; color: rgba(255,255,255,0.5); display: block; margin-bottom: 2px; }
-.sub-block .sub-char { font-size: 9px; font-weight: 700; display: block; margin-bottom: 2px; }
-.sub-block .sub-text { display: block; word-break: break-word; }
+.footer .shortcuts { color: #555; margin-left: auto; }
+.footer kbd { background: #333; padding: 1px 5px; border-radius: 2px; font-size: 10px; color: #aaa; }
 
-/* Bottom panel — tags + recommendations */
-.bottom-panel {
-    height: 300px; display: flex; border-top: 1px solid #333;
-}
-.tags-panel {
-    flex: 1; overflow-y: auto; padding: 8px 12px; background: #0f0f0f;
-}
-.tags-panel h3 { font-size: 13px; color: #888; margin-bottom: 8px; }
-.spk-group { margin-bottom: 8px; border: 1px solid #2a2a2a; border-radius: 6px; overflow: hidden; }
-.spk-header {
-    display: flex; align-items: center; gap: 8px; padding: 6px 10px;
-    background: #1a1a1a; cursor: pointer; font-size: 12px; user-select: none;
-}
-.spk-header:hover { background: #222; }
-.spk-name { font-weight: 700; font-size: 13px; min-width: 120px; }
-.spk-stats { color: #888; font-size: 11px; flex: 1; }
-.spk-rec { font-size: 11px; color: #6a8; margin-right: 4px; }
-.spk-assign {
-    font-size: 11px; padding: 2px 8px; border: 1px solid #555; border-radius: 3px;
-    background: #2a2a4e; color: #ccc; cursor: pointer;
-}
-.spk-assign:hover { background: #3a3a6e; border-color: #6a4aac; }
-.spk-del-all {
-    font-size: 11px; padding: 2px 8px; border: 1px solid #533; border-radius: 3px;
-    background: #2a1a1a; color: #c88; cursor: pointer;
-}
-.spk-del-all:hover { background: #3a2a2a; border-color: #c44; }
-.spk-segments { display: none; padding: 2px 0; background: #111; }
-.spk-segments.open { display: block; }
-.spk-seg {
-    display: flex; align-items: center; gap: 6px; padding: 3px 10px;
-    font-size: 11px; cursor: pointer; color: #aaa;
-}
-.spk-seg:hover { background: #1a1a2a; }
-.spk-seg .seg-time { font-family: monospace; color: #888; min-width: 100px; }
-.spk-seg .seg-dur { color: #666; min-width: 40px; }
-.spk-seg .seg-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #777; }
-.spk-seg .seg-del { color: #c44; cursor: pointer; padding: 0 4px; }
-.spk-seg .seg-del:hover { color: #f66; }
-
-.recs-panel {
-    width: 320px; overflow-y: auto; padding: 8px 12px;
-    background: #111; border-left: 1px solid #333;
-}
-.recs-panel h3 { font-size: 13px; color: #888; margin-bottom: 8px; }
-.rec-item {
-    padding: 6px 8px; margin-bottom: 4px; border-radius: 4px;
-    background: #1a1a2e; font-size: 12px; cursor: pointer;
-    border: 1px dashed #3a3a5c;
-}
-.rec-item:hover { border-color: #6a4aac; }
-.rec-item .rec-char { font-weight: 700; }
-.rec-item .rec-score { color: #888; float: right; }
-.rec-item .rec-text { color: #999; font-size: 11px; margin-top: 2px; display: block; }
-.rec-item .rec-actions { margin-top: 4px; }
-.rec-item .rec-actions button {
-    font-size: 11px; padding: 2px 8px; border: none; border-radius: 3px; cursor: pointer; margin-right: 4px;
-}
-.rec-accept { background: #2a5a2a; color: #fff; }
-.rec-accept:hover { background: #3a7a3a; }
-.rec-dismiss { background: #5a2a2a; color: #fff; }
-.rec-dismiss:hover { background: #7a3a3a; }
-
-/* Quality score card */
+/* ── Quality card (modal) ── */
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 999; display: none; }
 .quality-card {
     position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
     background: #1a1a2e; border: 1px solid #444; border-radius: 8px;
     padding: 24px; z-index: 1000; min-width: 350px; display: none;
 }
-.quality-card h3 { margin-bottom: 12px; }
-.quality-card .close-btn {
-    position: absolute; top: 8px; right: 12px; cursor: pointer; color: #888;
-    font-size: 18px; background: none; border: none;
-}
-.quality-card .score { font-size: 36px; font-weight: 700; text-align: center; margin: 12px 0; }
-.quality-card .score.excellent { color: #4caf50; }
-.quality-card .score.good { color: #8bc34a; }
-.quality-card .score.acceptable { color: #ffc107; }
-.quality-card .score.poor { color: #f44336; }
-.quality-card .details { font-size: 13px; color: #aaa; line-height: 1.8; }
-.overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 999; display: none; }
+.quality-card .close-btn { position: absolute; top: 8px; right: 12px; cursor: pointer; color: #888; font-size: 18px; background: none; border: none; }
 
-/* Face analysis popup */
-.face-popup {
-    position: absolute; background: #1a1a2e; border: 1px solid #444;
-    border-radius: 6px; padding: 8px; z-index: 100; font-size: 12px; min-width: 180px;
-    display: none;
+/* ── Diarization modal ── */
+.diar-modal {
+    position: fixed; inset: 20px; background: #0f0f1a;
+    border: 1px solid #444; border-radius: 8px; z-index: 1001;
+    display: none; flex-direction: column; overflow: hidden;
 }
-.face-popup .face-match { padding: 4px 0; cursor: pointer; }
-.face-popup .face-match:hover { color: #aaf; }
-.face-popup .face-match .sim { color: #888; float: right; }
-
-/* Keyboard shortcuts help */
-.shortcuts { position: fixed; bottom: 8px; right: 8px; font-size: 10px; color: #444; }
+.diar-modal.open { display: flex; }
+.diar-header {
+    display: flex; align-items: center; gap: 10px; padding: 10px 16px;
+    background: #1a1a2e; border-bottom: 1px solid #333; flex-shrink: 0; flex-wrap: wrap;
+}
+.diar-header h3 { margin: 0; font-size: 14px; }
+.diar-header .dh-status { color: #888; font-size: 12px; flex: 1; min-width: 0; }
+.diar-body { flex: 1; overflow-y: auto; padding: 12px 16px; }
+.diar-scene-section { margin-bottom: 12px; }
+.diar-scene-label { font-size: 11px; color: #555; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; padding: 0 4px; }
+.diar-group {
+    display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+    margin-bottom: 3px; background: #111; border-radius: 4px;
+    border-left: 4px solid #444; flex-wrap: wrap; min-height: 46px;
+}
+.diar-group.tier-clean  { border-left-color: #4caf50; }
+.diar-group.tier-likely { border-left-color: #ffc107; }
+.diar-group.tier-impure { border-left-color: #f44336; }
+.diar-group.dg-accepted { opacity: 0.45; }
+.dg-meta { min-width: 130px; flex-shrink: 0; }
+.dg-seg   { font-weight: 700; font-size: 12px; color: #ccc; }
+.dg-spk   { font-size: 11px; color: #666; font-family: monospace; }
+.dg-stats { font-size: 11px; color: #888; }
+.dg-suggestion { flex: 1; display: flex; align-items: center; gap: 6px; min-width: 0; flex-wrap: wrap; }
+.dg-char { font-weight: 700; font-size: 13px; }
+.dg-conf { font-size: 11px; color: #888; }
+.dg-breakdown { font-size: 10px; color: #555; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px; }
+.dg-tier-badge {
+    font-size: 10px; padding: 1px 6px; border-radius: 3px;
+    font-weight: 700; text-transform: uppercase; flex-shrink: 0;
+}
+.dg-tier-badge.clean  { background: #1a3a1a; color: #4caf50; }
+.dg-tier-badge.likely { background: #3a3000; color: #ffc107; }
+.dg-tier-badge.impure { background: #3a0a0a; color: #f66; }
+.dg-actions { display: flex; gap: 4px; flex-shrink: 0; }
+.dg-btn { font-size: 11px; padding: 3px 9px; border: none; border-radius: 3px; cursor: pointer; font-weight: 600; }
+.dg-btn.dg-seek    { background: #252540; color: #ccf; }
+.dg-btn.dg-seek:hover { background: #3a3a6a; }
+.dg-btn.dg-confirm { background: #2a5a2a; color: #cfc; }
+.dg-btn.dg-confirm:hover { background: #3a7a3a; }
+.dg-btn.dg-change  { background: #3a3a5c; color: #ccf; }
+.dg-btn.dg-change:hover { background: #4a4a7c; }
+.dg-btn.dg-done    { background: #1a3a1a; color: #6c6; cursor: default; }
+.diar-run-section { text-align: center; padding: 60px 20px; }
+.diar-run-section p { color: #888; margin-bottom: 20px; line-height: 1.6; }
+.diar-progress-wrap { padding: 40px 20px; text-align: center; }
+.diar-progress-bar { height: 8px; background: #222; border-radius: 4px; overflow: hidden; max-width: 400px; margin: 10px auto; }
+.diar-progress-fill { height: 100%; background: #4caf50; border-radius: 4px; transition: width 0.5s; }
 </style>
 </head>
 <body>
 
-<!-- Top Bar -->
+<!-- ═══ Top Bar ═══ -->
 <div class="topbar">
     <select id="episodeSelect" onchange="loadEpisode(this.value)">
         <option value="">Select Episode...</option>
     </select>
-    <button onclick="refreshRecommendations()">Refresh Recs</button>
+    <div class="progress-row">
+        <div class="progress-outer"><div class="progress-inner" id="progressBar" style="width:0;background:#f44"></div></div>
+        <span class="progress-text" id="progressText">0/0</span>
+    </div>
+    <span class="tier-counts" id="tierCounts"></span>
+    <button class="tb-btn accept-all" onclick="acceptAllTier1()" title="Ctrl+Shift+Y">Accept All Tier 1</button>
+    <div class="filter-group">
+        <button class="tb-btn active" id="filterAll" onclick="setFilter('all')">All</button>
+        <button class="tb-btn" id="filterUntagged" onclick="setFilter('untagged')">Untagged</button>
+    </div>
+    <button class="tb-btn" id="btnScene" onclick="toggleScenePanel()" title="S">S Scene</button>
+    <button class="tb-btn" id="btnChars" onclick="toggleCharPanel()" title="C">C Chars</button>
+    <button class="tb-btn" id="btnDiarize" onclick="openDiarModal()" title="Speaker group resolution">Diarize</button>
     <span class="status" id="statusText">Ready</span>
 </div>
 
-<!-- Main Layout -->
+<!-- ═══ Main Layout ═══ -->
 <div class="main">
+    <!-- Scene Panel (hidden by default, toggle with S) -->
+    <div class="scene-panel" id="scenePanel">
+        <h3>Scene Data</h3>
+        <div id="sceneContent"><div style="color:#555;text-align:center;padding:20px">Scene data loads during playback</div></div>
+    </div>
+
     <!-- Video Player -->
     <div class="video-panel" id="videoPanel">
         <video id="videoPlayer" preload="metadata"></video>
         <div class="video-controls">
-            <button onclick="videoPlayer.paused ? videoPlayer.play() : videoPlayer.pause()" title="Space">Play/Pause</button>
-            <button onclick="seekRelative(-5)" title="Left">-5s</button>
+            <button onclick="videoPlayer.paused ? videoPlayer.play() : videoPlayer.pause()" title="Space">Play</button>
+            <button onclick="seekRelative(-5)">-5s</button>
             <button onclick="seekRelative(-1)">-1s</button>
             <button onclick="seekRelative(1)">+1s</button>
-            <button onclick="seekRelative(5)" title="Right">+5s</button>
+            <button onclick="seekRelative(5)">+5s</button>
             <span class="time-display" id="timeDisplay">0:00 / 0:00</span>
-            <span style="width:16px"></span>
-            <button onclick="markStart()" id="markStartBtn" title="[">Mark Start</button>
-            <button onclick="markEnd()" id="markEndBtn" title="]">Mark End</button>
-            <span class="selection-display" id="selectionDisplay"></span>
-            <button onclick="analyzeFrame()" title="A">Analyze</button>
-            <button onclick="createTagFromSelection()" title="Enter">Tag</button>
         </div>
     </div>
 
-    <!-- Character Panel -->
+    <!-- Subtitle List (main work area) -->
+    <div class="sub-list-panel" id="subListPanel">
+        <div id="subListContent"></div>
+    </div>
+
+    <!-- Character Panel (hidden by default, toggle with C) -->
     <div class="char-panel" id="charPanel">
         <h3>Characters</h3>
-        <div id="recentChars" class="recent-chars"></div>
-        <input type="text" id="charSearch" class="char-search" placeholder="Search..." oninput="renderCharacterPanel()">
-        <div id="charList"></div>
-        <div class="char-actions">
-            <button onclick="extractAllSamples()">Extract All Audio</button>
-            <button class="clone-btn" onclick="evaluateClone()">Clone Voice</button>
-        </div>
+        <input type="text" class="cp-search" id="charPanelSearch" placeholder="Search..." oninput="renderCharPanel()">
+        <div id="charPanelList"></div>
     </div>
 </div>
 
-<!-- Subtitle Strip -->
-<div class="sub-strip-header">
-    <span>Subtitles</span>
-    <span id="subInfo"></span>
-</div>
-<div class="sub-strip" id="subStrip">
-    <div class="sub-strip-inner" id="subStripInner"></div>
-</div>
-
-<!-- Bottom Panel -->
-<div class="bottom-panel">
-    <div class="tags-panel">
-        <h3>Tags (<span id="tagCount">0</span>)</h3>
-        <div id="speakerGroups"></div>
-    </div>
-    <div class="recs-panel">
-        <h3>Recommendations</h3>
-        <div id="recsList"></div>
-    </div>
+<!-- ═══ Footer ═══ -->
+<div class="footer">
+    <span id="footerTagged">0 tagged</span>
+    <span id="footerRemaining">0 remaining</span>
+    <span id="footerSpeed"></span>
+    <span id="footerEta"></span>
+    <span class="shortcuts">
+        <kbd>Y</kbd> Accept <kbd>N</kbd> Change <kbd>J</kbd>/<kbd>K</kbd> Nav
+        <kbd>1</kbd>-<kbd>9</kbd> Quick-assign <kbd>Shift+Y</kbd> Scene T1
+        <kbd>Space</kbd> Play <kbd>F</kbd> Filter <kbd>S</kbd> Scene <kbd>C</kbd> Chars
+    </span>
 </div>
 
-<!-- Face Analysis Popup -->
-<div class="face-popup" id="facePopup"></div>
-
-<!-- Quality Score Card -->
+<!-- Quality Card Modal -->
 <div class="overlay" id="qualityOverlay" onclick="closeQualityCard()"></div>
 <div class="quality-card" id="qualityCard">
     <button class="close-btn" onclick="closeQualityCard()">&times;</button>
@@ -610,9 +740,18 @@ body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f0f0f; colo
     <div id="qualityContent"></div>
 </div>
 
-<!-- Keyboard shortcuts hint -->
-<div class="shortcuts">
-    [ Mark Start &nbsp; ] Mark End &nbsp; Enter Tag &nbsp; A Analyze &nbsp; Space Play/Pause &nbsp; Arrows Seek
+<!-- Diarization Modal -->
+<div class="overlay" id="diarOverlay" onclick="closeDiarModal()"></div>
+<div class="diar-modal" id="diarModal">
+    <div class="diar-header">
+        <h3>Speaker Group Resolution</h3>
+        <span class="dh-status" id="diarHeaderStatus"></span>
+        <button class="tb-btn accept-all" onclick="acceptAllCleanGroups()">Accept All Clean</button>
+        <button class="tb-btn" onclick="closeDiarModal()" style="background:#333">Done</button>
+    </div>
+    <div class="diar-body" id="diarBody">
+        <div style="text-align:center;padding:60px;color:#555">Select an episode first.</div>
+    </div>
 </div>
 
 <script>
@@ -620,20 +759,28 @@ body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f0f0f; colo
 // STATE
 // ============================================================
 let currentEpisode = null;
-let subtitles = [];
-let tags = [];
-let characterTotals = {};
-let characters = {};
-let selectedCharacter = null;
-let selectionStart = null;
-let selectionEnd = null;
-let recommendations = [];
-let recentCharacters = [];  // last 10 used characters
-const MAX_RECENT = 10;
+let enrichedSubs = [];       // from /enriched_subtitles
+let characters = {};         // from /characters
+let allCharNames = [];       // sorted character name list
+let focusedIndex = -1;       // index in enrichedSubs of focused row
+let pickerOpenIndex = -1;    // index where character picker is open
+let filterMode = 'all';      // 'all' or 'untagged'
+let tagStartTime = null;     // for speed tracking
+let tagCount = 0;            // tags made this session
+
+// Scene panel state
+let currentSceneNumber = null;
+let currentSceneRange = null;
+let currentSceneData = null;
+let lastSceneUpdateTime = 0;
+
+// Recent characters for picker
+let recentCharacters = [];
+const MAX_RECENT = 8;
 
 const videoPlayer = document.getElementById('videoPlayer');
 
-// Character colors — deterministic from name hash
+// ── Color helpers ──
 function charColor(name) {
     if (!name) return '#555';
     let h = 0;
@@ -641,466 +788,579 @@ function charColor(name) {
     h = ((h % 360) + 360) % 360;
     return `hsl(${h}, 65%, 45%)`;
 }
-
-function charColorBg(name) {
-    if (!name) return '#252525';
+function charColorLight(name) {
+    if (!name) return '#888';
     let h = 0;
     for (let i = 0; i < name.length; i++) h = name.charCodeAt(i) + ((h << 5) - h);
     h = ((h % 360) + 360) % 360;
-    return `hsl(${h}, 40%, 20%)`;
+    return `hsl(${h}, 60%, 70%)`;
 }
 
 // ============================================================
-// INITIALIZATION
+// INIT
 // ============================================================
 async function init() {
-    // Load episodes
     const eps = await fetchJson('/api/episodes');
     const sel = document.getElementById('episodeSelect');
     eps.forEach(ep => {
         const opt = document.createElement('option');
         opt.value = ep.episode_id;
         opt.textContent = `${ep.episode_id} (${formatTime(ep.duration_sec)})`;
-        if (ep.has_scan) opt.textContent += ` [${ep.face_count} faces]`;
         sel.appendChild(opt);
     });
+    characters = await fetchJson('/api/characters');
+    allCharNames = Object.keys(characters).sort();
 
-    // Load characters
-    await loadCharacters();
+    // Restore panel visibility from localStorage
+    if (localStorage.getItem('vt_scene_panel') === '1') toggleScenePanel();
+    if (localStorage.getItem('vt_char_panel') === '1') toggleCharPanel();
 
-    // Auto-load first episode
     if (eps.length > 0) {
         sel.value = eps[0].episode_id;
         loadEpisode(eps[0].episode_id);
     }
 }
 
-async function loadCharacters() {
-    characters = await fetchJson('/api/characters');
-    renderCharacterPanel();
-}
-
 async function loadEpisode(epId) {
     if (!epId) return;
     currentEpisode = epId;
+    currentSceneNumber = null;
+    currentSceneRange = null;
+    currentSceneData = null;
+    focusedIndex = -1;
+    pickerOpenIndex = -1;
+    tagStartTime = null;
+    tagCount = 0;
     setStatus(`Loading ${epId}...`);
 
-    // Load video
     videoPlayer.src = `/video/${epId}`;
-
-    // Load subtitles
-    subtitles = await fetchJson(`/api/episode/${epId}/subtitles`);
-    renderSubtitleStrip();
-    document.getElementById('subInfo').textContent = `${subtitles.length} subtitles`;
-
-    // Load tags
-    await refreshTags();
-
-    // Load recommendations
-    await refreshRecommendations();
-
-    setStatus(`Loaded ${epId}`);
+    await refreshEnriched();
+    setStatus(`Loaded ${epId} — ${enrichedSubs.length} subtitles`);
 }
 
-// ============================================================
-// VIDEO CONTROLS
-// ============================================================
-function seekRelative(sec) {
-    videoPlayer.currentTime = Math.max(0, videoPlayer.currentTime + sec);
-}
-
-videoPlayer.addEventListener('timeupdate', () => {
-    const cur = videoPlayer.currentTime;
-    const dur = videoPlayer.duration || 0;
-    document.getElementById('timeDisplay').textContent = `${formatTime(cur)} / ${formatTime(dur)}`;
-
-    // Highlight current subtitle
-    document.querySelectorAll('.sub-block.current').forEach(el => el.classList.remove('current'));
-    for (let i = 0; i < subtitles.length; i++) {
-        if (cur >= subtitles[i].start && cur <= subtitles[i].end) {
-            const el = document.getElementById(`sub_${i}`);
-            if (el) {
-                el.classList.add('current');
-                // Auto-scroll subtitle strip
-                el.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
-            }
-            break;
-        }
-    }
-
-    hideFacePopup();
-});
-
-// ============================================================
-// MARK START / END SELECTION
-// ============================================================
-function markStart() {
-    selectionStart = videoPlayer.currentTime;
-    updateSelectionDisplay();
-    document.getElementById('markStartBtn').classList.add('active');
-}
-
-function markEnd() {
-    selectionEnd = videoPlayer.currentTime;
-    if (selectionStart !== null && selectionEnd < selectionStart) {
-        [selectionStart, selectionEnd] = [selectionEnd, selectionStart];
-    }
-    updateSelectionDisplay();
-    document.getElementById('markEndBtn').classList.add('active');
-}
-
-function updateSelectionDisplay() {
-    const el = document.getElementById('selectionDisplay');
-    if (selectionStart !== null && selectionEnd !== null) {
-        const dur = selectionEnd - selectionStart;
-        el.textContent = `Selected: ${formatTime(selectionStart)} - ${formatTime(selectionEnd)} (${dur.toFixed(1)}s)`;
-    } else if (selectionStart !== null) {
-        el.textContent = `Start: ${formatTime(selectionStart)} (press ] for end)`;
-    } else {
-        el.textContent = '';
-    }
-}
-
-function clearSelection() {
-    selectionStart = null;
-    selectionEnd = null;
-    updateSelectionDisplay();
-    document.getElementById('markStartBtn').classList.remove('active');
-    document.getElementById('markEndBtn').classList.remove('active');
-}
-
-// ============================================================
-// TAG MANAGEMENT
-// ============================================================
-async function createTagFromSelection() {
-    if (!currentEpisode || selectionStart === null || selectionEnd === null) {
-        setStatus('Select a time range first ([ and ])');
-        return;
-    }
-    if (!selectedCharacter) {
-        setStatus('Select a character from the panel first');
-        return;
-    }
-
-    // Find subtitle text in the selection range
-    let subText = '';
-    for (const sub of subtitles) {
-        if (sub.start >= selectionStart && sub.end <= selectionEnd) {
-            subText += sub.text + ' ';
-        }
-    }
-
-    const tag = await fetchJson(`/api/episode/${currentEpisode}/tags`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-            character: selectedCharacter,
-            start_sec: selectionStart,
-            end_sec: selectionEnd,
-            subtitle_text: subText.trim(),
-        }),
-    });
-
-    addToRecent(selectedCharacter);
-    clearSelection();
-    await refreshTags();
-    await loadCharacters();
-    await refreshRecommendations();
-    setStatus(`Tagged ${selectedCharacter}: ${tag.duration_sec}s`);
-}
-
-async function deleteTag(tagId) {
-    await fetchJson(`/api/episode/${currentEpisode}/tags/${tagId}`, { method: 'DELETE' });
-    await refreshTags();
-    await loadCharacters();
-    setStatus('Tag deleted');
-}
-
-async function refreshTags() {
+async function refreshEnriched() {
     if (!currentEpisode) return;
-    const data = await fetchJson(`/api/episode/${currentEpisode}/tags`);
-    tags = data.tags || [];
-    characterTotals = data.character_totals || {};
-    renderTagTable();
-    renderSubtitleStrip();
-}
-
-// Find English subtitle text overlapping a time range
-function getEnglishText(startSec, endSec) {
-    const parts = [];
-    for (const sub of subtitles) {
-        // Subtitle overlaps if it starts before tag ends and ends after tag starts
-        if (sub.start < endSec && sub.end > startSec) {
-            parts.push(sub.text);
-        }
-    }
-    return parts.join(' | ') || '';
-}
-
-function renderTagTable() {
-    const container = document.getElementById('speakerGroups');
-    document.getElementById('tagCount').textContent = tags.length;
-    container.innerHTML = '';
-
-    // Group tags by speaker (character field)
-    const groups = {};
-    const groupOrder = [];
-    for (const tag of tags) {
-        const spk = tag.character || 'Unknown';
-        if (!groups[spk]) {
-            groups[spk] = [];
-            groupOrder.push(spk);
-        }
-        groups[spk].push(tag);
-    }
-
-    // Sort groups by total duration descending
-    groupOrder.sort((a, b) => {
-        const durA = groups[a].reduce((s, t) => s + (t.duration_sec || 0), 0);
-        const durB = groups[b].reduce((s, t) => s + (t.duration_sec || 0), 0);
-        return durB - durA;
-    });
-
-    for (const spk of groupOrder) {
-        const spkTags = groups[spk];
-        const totalDur = spkTags.reduce((s, t) => s + (t.duration_sec || 0), 0).toFixed(1);
-
-        const group = document.createElement('div');
-        group.className = 'spk-group';
-
-        // Header row
-        const header = document.createElement('div');
-        header.className = 'spk-header';
-        header.innerHTML = `
-            <span class="spk-name" style="color:${charColor(spk)}">${spk}</span>
-            <span class="spk-stats">${spkTags.length} segments, ${totalDur}s</span>
-            <span class="spk-rec" id="spkRec_${spk.replace(/[^a-zA-Z0-9]/g, '_')}" title="VLM recommendation"></span>
-            <button class="spk-assign" onclick="event.stopPropagation(); assignSpeaker('${escapeJs(spk)}')" title="Assign a character to all segments">Assign</button>
-            <button class="spk-del-all" onclick="event.stopPropagation(); deleteAllSpeaker('${escapeJs(spk)}')" title="Delete all segments for this speaker">Del All</button>
-        `;
-        // Toggle collapse on header click
-        header.addEventListener('click', () => {
-            const segs = group.querySelector('.spk-segments');
-            segs.classList.toggle('open');
-        });
-        group.appendChild(header);
-
-        // Segments list (collapsed by default)
-        const segsDiv = document.createElement('div');
-        segsDiv.className = 'spk-segments';
-        for (const tag of spkTags) {
-            const seg = document.createElement('div');
-            seg.className = 'spk-seg';
-            seg.innerHTML = `
-                <span class="seg-time">${formatTime(tag.start_sec)} - ${formatTime(tag.end_sec)}</span>
-                <span class="seg-dur">${tag.duration_sec}s</span>
-                <span class="seg-text">${getEnglishText(tag.start_sec, tag.end_sec)}</span>
-                <span class="seg-del" onclick="event.stopPropagation(); deleteTag('${tag.tag_id}')" title="Delete">&times;</span>
-            `;
-            seg.addEventListener('click', () => {
-                videoPlayer.currentTime = tag.start_sec;
-                videoPlayer.play();
-            });
-            segsDiv.appendChild(seg);
-        }
-        group.appendChild(segsDiv);
-        container.appendChild(group);
-
-        // Fire off VLM recommendation for this speaker
-        fetchSpeakerRec(spk);
-    }
-}
-
-async function fetchSpeakerRec(speaker) {
-    if (!currentEpisode) return;
-    const el = document.getElementById('spkRec_' + speaker.replace(/[^a-zA-Z0-9]/g, '_'));
-    if (!el) return;
-    el.textContent = '...';
-    const result = await fetchJson(`/api/episode/${currentEpisode}/speaker_recommendation`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ speaker }),
-    });
-    if (result.character) {
-        const cands = (result.candidates || []).map(c => `${c.name}: ${c.score}s`).join(', ');
-        el.innerHTML = `<span title="${cands}" style="cursor:help">Likely: <b style="color:${charColor(result.character)}">${result.character}</b> (${(result.confidence * 100).toFixed(0)}%)</span>`;
-    } else {
-        el.textContent = result.reason || '';
-    }
-}
-
-async function assignSpeaker(speaker) {
-    if (!currentEpisode) return;
-    const name = prompt(`Assign all "${speaker}" segments to which character?`);
-    if (!name || name.trim() === '') return;
-    setStatus(`Renaming ${speaker} -> ${name.trim()}...`);
-    const result = await fetchJson(`/api/episode/${currentEpisode}/rename_speaker`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ old_name: speaker, new_name: name.trim() }),
-    });
-    addToRecent(name.trim());
-    await refreshTags();
-    await loadCharacters();
-    setStatus(`Renamed ${result.renamed} tags: ${speaker} -> ${name.trim()}`);
-}
-
-async function deleteAllSpeaker(speaker) {
-    if (!currentEpisode) return;
-    if (!confirm(`Delete ALL segments for "${speaker}"?`)) return;
-    setStatus(`Deleting all ${speaker} tags...`);
-    const result = await fetchJson(`/api/episode/${currentEpisode}/delete_speaker`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ speaker }),
-    });
-    await refreshTags();
-    await loadCharacters();
-    setStatus(`Deleted ${result.deleted} tags for ${speaker}`);
+    enrichedSubs = await fetchJson(`/api/episode/${currentEpisode}/enriched_subtitles`);
+    renderSubList();
+    updateProgress();
+    renderCharPanel();
 }
 
 // ============================================================
-// SUBTITLE STRIP
+// PROGRESS TRACKING
 // ============================================================
-function renderSubtitleStrip() {
-    const container = document.getElementById('subStripInner');
-    container.innerHTML = '';
+function updateProgress() {
+    const total = enrichedSubs.length;
+    const tagged = enrichedSubs.filter(s => s.tag).length;
+    const remaining = total - tagged;
+    const pct = total > 0 ? Math.round(tagged / total * 100) : 0;
 
-    // Build tag lookup: find which subs are tagged
-    const tagLookup = {};
-    for (const tag of tags) {
-        for (let i = 0; i < subtitles.length; i++) {
-            const sub = subtitles[i];
-            if (sub.start >= tag.start_sec - 0.5 && sub.end <= tag.end_sec + 0.5) {
-                tagLookup[i] = tag;
-            }
-        }
-    }
+    // Tier counts (among untagged)
+    const untagged = enrichedSubs.filter(s => !s.tag);
+    const t1 = untagged.filter(s => s.tier === 1).length;
+    const t2 = untagged.filter(s => s.tier === 2).length;
+    const t3 = untagged.filter(s => s.tier === 3).length;
 
-    // Build recommendation lookup
-    const recLookup = {};
-    for (const rec of recommendations) {
-        for (let i = 0; i < subtitles.length; i++) {
-            const sub = subtitles[i];
-            if (Math.abs(sub.start - rec.start_sec) < 0.5 && Math.abs(sub.end - rec.end_sec) < 0.5) {
-                recLookup[i] = rec;
-            }
-        }
-    }
+    // Progress bar color
+    const bar = document.getElementById('progressBar');
+    bar.style.width = pct + '%';
+    bar.style.background = pct < 30 ? '#f44' : pct < 70 ? '#ffc107' : '#4caf50';
 
-    for (let i = 0; i < subtitles.length; i++) {
-        const sub = subtitles[i];
-        const block = document.createElement('div');
-        block.className = 'sub-block';
-        block.id = `sub_${i}`;
+    document.getElementById('progressText').textContent = `${tagged}/${total} (${pct}%)`;
+    document.getElementById('tierCounts').innerHTML =
+        `<span class="t1">T1:${t1}</span> <span class="t2">T2:${t2}</span> <span class="t3">T3:${t3}</span>`;
 
-        const tag = tagLookup[i];
-        const rec = recLookup[i];
+    // Footer
+    document.getElementById('footerTagged').textContent = `${tagged} tagged`;
+    document.getElementById('footerRemaining').textContent = `${remaining} remaining`;
 
-        if (tag) {
-            block.classList.add('tagged');
-            block.style.background = charColorBg(tag.character);
-            block.style.borderColor = charColor(tag.character);
-            block.innerHTML = `
-                <span class="sub-time">${formatTime(sub.start)}</span>
-                <span class="sub-char" style="color:${charColor(tag.character)}">${tag.character}</span>
-                <span class="sub-text">${sub.text}</span>
-            `;
-        } else if (rec) {
-            block.classList.add('suggested');
-            block.style.borderColor = charColor(rec.character);
-            block.style.background = charColorBg(rec.character);
-            block.innerHTML = `
-                <span class="sub-time">${formatTime(sub.start)}</span>
-                <span class="sub-char" style="color:${charColor(rec.character)}">${rec.character}? (${(rec.score*100).toFixed(0)}%)</span>
-                <span class="sub-text">${sub.text}</span>
-            `;
+    // Speed + ETA
+    if (tagStartTime && tagCount > 0) {
+        const elapsed = (Date.now() - tagStartTime) / 1000 / 60; // minutes
+        const speed = tagCount / elapsed;
+        document.getElementById('footerSpeed').textContent = `~${speed.toFixed(1)} tags/min`;
+        if (remaining > 0 && speed > 0) {
+            const eta = remaining / speed;
+            document.getElementById('footerEta').textContent = `ETA ~${eta.toFixed(0)} min`;
         } else {
-            block.classList.add('untagged');
-            block.innerHTML = `
-                <span class="sub-time">${formatTime(sub.start)}</span>
-                <span class="sub-text">${sub.text}</span>
-            `;
+            document.getElementById('footerEta').textContent = '';
         }
-
-        block.addEventListener('click', () => {
-            videoPlayer.currentTime = sub.start;
-            videoPlayer.play();
-        });
-
-        // Right-click: if tagged -> delete tag, if untagged -> quick-tag
-        block.addEventListener('contextmenu', ((tag, sub) => (e) => {
-            e.preventDefault();
-            if (tag) {
-                deleteTag(tag.tag_id);
-            } else if (selectedCharacter) {
-                quickTag(sub.start, sub.end, sub.text);
-            }
-        })(tag, sub));
-
-        container.appendChild(block);
     }
 }
 
-async function quickTag(start, end, text) {
-    if (!selectedCharacter || !currentEpisode) return;
+// ============================================================
+// RENDER SUBTITLE LIST (grouped by scene)
+// ============================================================
+function renderSubList() {
+    const container = document.getElementById('subListContent');
+    container.innerHTML = '';
+
+    // Group by scene_number
+    const groups = [];
+    let curGroup = null;
+    for (let i = 0; i < enrichedSubs.length; i++) {
+        const sub = enrichedSubs[i];
+        const sn = sub.scene_number;
+        if (!curGroup || curGroup.scene_number !== sn) {
+            curGroup = {
+                scene_number: sn,
+                scene_type: sub.scene_type,
+                scene_location: sub.scene_location,
+                scene_chars: sub.scene_chars || [],
+                items: [],
+            };
+            groups.push(curGroup);
+        }
+        curGroup.items.push({ ...sub, _idx: i });
+    }
+
+    for (const group of groups) {
+        const totalInGroup = group.items.length;
+        const taggedInGroup = group.items.filter(s => s.tag).length;
+        const allDone = taggedInGroup === totalInGroup;
+
+        // Filter: in 'untagged' mode, skip fully-tagged scenes
+        const visibleItems = filterMode === 'untagged'
+            ? group.items.filter(s => !s.tag)
+            : group.items;
+        if (filterMode === 'untagged' && visibleItems.length === 0) continue;
+
+        const gDiv = document.createElement('div');
+        gDiv.className = 'scene-group' + (allDone ? ' collapsed' : '');
+        gDiv.dataset.sceneNumber = group.scene_number || '';
+
+        // Header
+        const header = document.createElement('div');
+        header.className = 'scene-group-header';
+        let headerHtml = `<span class="sg-title">Scene ${group.scene_number || '?'}</span>`;
+        if (group.scene_type) {
+            const badgeColor = {'story':'#2a3a5a','flashback':'#5a3a2a','opening':'#2a5a3a','ending':'#5a2a5a','recap':'#5a5a2a','eyecatch':'#5a3a5a'}[group.scene_type] || '#333';
+            headerHtml += `<span class="sg-badge" style="background:${badgeColor}">${escapeHtml(group.scene_type)}</span>`;
+        }
+        if (group.scene_location) headerHtml += `<span class="sg-location">${escapeHtml(group.scene_location)}</span>`;
+
+        // Character chips
+        headerHtml += '<span class="sg-chars">';
+        for (const c of (group.scene_chars || []).slice(0, 5)) {
+            headerHtml += `<span class="sg-char-chip" style="color:${charColorLight(c.name)};border-color:${charColor(c.name)}44">${escapeHtml(c.name)}</span>`;
+        }
+        headerHtml += '</span>';
+
+        // Per-scene progress
+        headerHtml += `<span class="sg-progress${allDone ? ' sg-done' : ''}">${taggedInGroup}/${totalInGroup}</span>`;
+        header.innerHTML = headerHtml;
+        header.addEventListener('click', () => gDiv.classList.toggle('collapsed'));
+        gDiv.appendChild(header);
+
+        // Body (subtitle rows)
+        const body = document.createElement('div');
+        body.className = 'scene-group-body';
+        for (const item of visibleItems) {
+            body.appendChild(createSubRow(item));
+        }
+        gDiv.appendChild(body);
+        container.appendChild(gDiv);
+    }
+}
+
+function createSubRow(item) {
+    const row = document.createElement('div');
+    row.className = 'sub-row';
+    row.dataset.idx = item._idx;
+    const idx = item._idx;
+
+    if (item.tag) {
+        row.classList.add('tagged');
+    } else if (item.tier === 1) {
+        row.classList.add('tier1');
+    } else if (item.tier === 2) {
+        row.classList.add('tier2');
+    } else {
+        row.classList.add('tier3');
+    }
+    if (idx === focusedIndex) row.classList.add('focused');
+
+    // Time
+    let html = `<span class="sr-time">${formatTime(item.start)}</span>`;
+    // Text
+    html += `<span class="sr-text">${escapeHtml(item.text)}</span>`;
+    // Signal area
+    html += '<span class="sr-signal">';
+
+    if (item.tag) {
+        // Tagged — show tag badge
+        const ch = item.tag.character;
+        const confLabel = item.tag.confidence === 'auto_accepted' ? 'A' : item.tag.confidence === 'accepted_rec' ? 'R' : 'M';
+        html += `<span class="sr-tag-badge" style="border-left:3px solid ${charColor(ch)}">`;
+        html += `<span class="sr-char-name" style="color:${charColorLight(ch)}">${escapeHtml(ch)}</span>`;
+        html += `<span style="font-size:9px;color:#888">${confLabel}</span>`;
+        html += `<span class="sr-del" onclick="event.stopPropagation();deleteTagByIndex(${idx})">&times;</span>`;
+        html += '</span>';
+    } else if (item.suggested_character) {
+        // Has suggestion — show accept/change
+        const ch = item.suggested_character;
+        html += `<span class="sr-suggestion" style="border-left:3px solid ${charColor(ch)}">`;
+        html += `<span class="sr-char-name" style="color:${charColorLight(ch)}">${escapeHtml(ch)}</span>`;
+        html += `<span class="sr-score">${Math.round(item.suggestion_score * 100)}%</span>`;
+        html += '</span>';
+        html += '<span class="sr-actions">';
+        html += `<button class="sr-btn sr-accept" onclick="event.stopPropagation();acceptSuggestion(${idx})" title="Y">Accept</button>`;
+        html += `<button class="sr-btn sr-change" onclick="event.stopPropagation();openPicker(${idx})" title="N">Chg</button>`;
+        html += '</span>';
+    } else {
+        // No suggestion — show scene char chips for quick assign
+        const chars = item.scene_chars || [];
+        if (chars.length > 0) {
+            html += '<span class="sr-unresolved-chips">';
+            for (let ci = 0; ci < chars.length && ci < 5; ci++) {
+                const c = chars[ci];
+                html += `<span class="sr-chip" style="color:${charColorLight(c.name)};border-color:${charColor(c.name)}44" onclick="event.stopPropagation();assignCharacter(${idx},'${escapeJs(c.name)}')">${escapeHtml(c.name)}</span>`;
+            }
+            html += `<span class="sr-chip" style="color:#888" onclick="event.stopPropagation();openPicker(${idx})">...</span>`;
+            html += '</span>';
+        } else {
+            html += `<button class="sr-btn sr-change" onclick="event.stopPropagation();openPicker(${idx})">Pick</button>`;
+        }
+    }
+
+    html += '</span>';
+    row.innerHTML = html;
+
+    // Click row -> seek + focus
+    row.addEventListener('click', () => {
+        setFocus(idx);
+        videoPlayer.currentTime = item.start;
+    });
+
+    // Wrap: row + optional picker
+    const wrapper = document.createDocumentFragment();
+    wrapper.appendChild(row);
+
+    // Picker div (hidden by default)
+    const picker = document.createElement('div');
+    picker.className = 'char-picker' + (pickerOpenIndex === idx ? ' open' : '');
+    picker.id = `picker_${idx}`;
+    picker.addEventListener('click', (e) => e.stopPropagation());
+    if (pickerOpenIndex === idx) {
+        picker.innerHTML = buildPickerHtml(item);
+    }
+    wrapper.appendChild(picker);
+
+    return wrapper;
+}
+
+function buildPickerHtml(item) {
+    const sceneChars = (item.scene_chars || []).map(c => c.name);
+    let html = '';
+
+    // Scene characters
+    if (sceneChars.length > 0) {
+        html += '<div class="cp-section-label">Scene characters</div><div class="cp-chips">';
+        for (const name of sceneChars) {
+            html += `<span class="cp-chip" style="color:${charColorLight(name)};border-color:${charColor(name)}" onclick="assignCharacter(${item._idx},'${escapeJs(name)}')">${escapeHtml(name)}</span>`;
+        }
+        html += '</div>';
+    }
+
+    // Recent
+    const recents = recentCharacters.filter(n => !sceneChars.includes(n));
+    if (recents.length > 0) {
+        html += '<div class="cp-section-label">Recent</div><div class="cp-chips">';
+        for (const name of recents) {
+            html += `<span class="cp-chip" style="color:${charColorLight(name)};border-color:${charColor(name)}44" onclick="assignCharacter(${item._idx},'${escapeJs(name)}')">${escapeHtml(name)}</span>`;
+        }
+        html += '</div>';
+    }
+
+    // Search + all chars
+    html += `<input type="text" class="cp-search" id="pickerSearch" placeholder="Search all characters..." oninput="filterPickerChars(${item._idx})" onkeydown="if(event.key==='Escape'){closePicker();event.stopPropagation();}">`;
+    html += `<div class="cp-all-chars" id="pickerAllChars">`;
+    const exclude = new Set([...sceneChars, ...recents]);
+    for (const name of allCharNames) {
+        if (exclude.has(name)) continue;
+        html += `<span class="cp-chip" style="color:${charColorLight(name)};border-color:${charColor(name)}44" onclick="assignCharacter(${item._idx},'${escapeJs(name)}')">${escapeHtml(name)}</span>`;
+    }
+    html += '</div>';
+    return html;
+}
+
+function filterPickerChars(idx) {
+    const search = document.getElementById('pickerSearch');
+    if (!search) return;
+    const q = search.value.toLowerCase();
+    const container = document.getElementById('pickerAllChars');
+    if (!container) return;
+    for (const chip of container.children) {
+        chip.style.display = chip.textContent.toLowerCase().includes(q) ? '' : 'none';
+    }
+}
+
+// ============================================================
+// ACTIONS
+// ============================================================
+async function acceptSuggestion(idx) {
+    const sub = enrichedSubs[idx];
+    if (!sub || !sub.suggested_character || sub.tag) return;
+    await createTag(sub.start, sub.end, sub.text, sub.suggested_character, 'accepted_rec');
+}
+
+async function assignCharacter(idx, character) {
+    const sub = enrichedSubs[idx];
+    if (!sub) return;
+    closePicker();
+    if (sub.tag) {
+        // Re-assign: delete old, create new
+        await fetchJson(`/api/episode/${currentEpisode}/tags/${sub.tag.tag_id}`, { method: 'DELETE' });
+    }
+    await createTag(sub.start, sub.end, sub.text, character, 'manual');
+}
+
+async function createTag(start, end, text, character, confidence) {
+    if (!currentEpisode) return;
+    if (!tagStartTime) tagStartTime = Date.now();
+    tagCount++;
+    addToRecent(character);
+
     await fetchJson(`/api/episode/${currentEpisode}/tags`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
-            character: selectedCharacter,
+            character: character,
             start_sec: start,
             end_sec: end,
             subtitle_text: text,
+            confidence: confidence,
         }),
     });
-    addToRecent(selectedCharacter);
-    await refreshTags();
-    await loadCharacters();
-    setStatus(`Quick-tagged ${selectedCharacter}`);
+    await refreshEnriched();
+    setStatus(`Tagged: ${character}`);
+}
+
+async function deleteTagByIndex(idx) {
+    const sub = enrichedSubs[idx];
+    if (!sub || !sub.tag) return;
+    await fetchJson(`/api/episode/${currentEpisode}/tags/${sub.tag.tag_id}`, { method: 'DELETE' });
+    await refreshEnriched();
+    setStatus('Tag removed');
+}
+
+async function acceptAllTier1() {
+    const t1 = enrichedSubs.filter(s => !s.tag && s.tier === 1 && s.suggested_character);
+    if (t1.length === 0) { setStatus('No Tier 1 to accept'); return; }
+    setStatus(`Accepting ${t1.length} Tier 1 tags...`);
+    if (!tagStartTime) tagStartTime = Date.now();
+
+    const accepts = t1.map(s => ({
+        start_sec: s.start, end_sec: s.end,
+        character: s.suggested_character, subtitle_text: s.text,
+    }));
+
+    await fetchJson(`/api/episode/${currentEpisode}/bulk_accept`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ accepts }),
+    });
+    tagCount += t1.length;
+    await refreshEnriched();
+    setStatus(`Accepted ${t1.length} Tier 1 tags!`);
+}
+
+async function acceptSceneTier1() {
+    // Accept Tier 1 in the scene of the currently focused row
+    const sub = enrichedSubs[focusedIndex];
+    if (!sub) return;
+    const sn = sub.scene_number;
+    const t1 = enrichedSubs.filter(s => !s.tag && s.tier === 1 && s.suggested_character && s.scene_number === sn);
+    if (t1.length === 0) { setStatus('No Tier 1 in this scene'); return; }
+
+    if (!tagStartTime) tagStartTime = Date.now();
+    const accepts = t1.map(s => ({
+        start_sec: s.start, end_sec: s.end,
+        character: s.suggested_character, subtitle_text: s.text,
+    }));
+    await fetchJson(`/api/episode/${currentEpisode}/bulk_accept`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ accepts }),
+    });
+    tagCount += t1.length;
+    await refreshEnriched();
+    setStatus(`Accepted ${t1.length} tags in scene ${sn}`);
+}
+
+// ============================================================
+// FOCUS / NAVIGATION
+// ============================================================
+function setFocus(idx) {
+    focusedIndex = idx;
+    // Update visual focus
+    document.querySelectorAll('.sub-row.focused').forEach(el => el.classList.remove('focused'));
+    const row = document.querySelector(`.sub-row[data-idx="${idx}"]`);
+    if (row) {
+        row.classList.add('focused');
+        row.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+}
+
+function focusNextUntagged(direction) {
+    if (enrichedSubs.length === 0) return;
+    const start = focusedIndex >= 0 ? focusedIndex : -1;
+    if (direction > 0) {
+        for (let i = start + 1; i < enrichedSubs.length; i++) {
+            if (!enrichedSubs[i].tag) { setFocus(i); return; }
+        }
+    } else {
+        for (let i = start - 1; i >= 0; i--) {
+            if (!enrichedSubs[i].tag) { setFocus(i); return; }
+        }
+    }
+}
+
+function jumpScene(direction) {
+    if (enrichedSubs.length === 0 || focusedIndex < 0) return;
+    const curScene = enrichedSubs[focusedIndex].scene_number;
+    if (direction > 0) {
+        for (let i = focusedIndex + 1; i < enrichedSubs.length; i++) {
+            if (enrichedSubs[i].scene_number !== curScene && !enrichedSubs[i].tag) {
+                setFocus(i);
+                // Expand that scene group if collapsed
+                const group = document.querySelector(`.sub-row[data-idx="${i}"]`)?.closest('.scene-group');
+                if (group && group.classList.contains('collapsed')) group.classList.remove('collapsed');
+                return;
+            }
+        }
+    } else {
+        let prevScene = null;
+        for (let i = focusedIndex - 1; i >= 0; i--) {
+            if (enrichedSubs[i].scene_number !== curScene) { prevScene = enrichedSubs[i].scene_number; break; }
+        }
+        if (prevScene !== null) {
+            for (let i = 0; i < enrichedSubs.length; i++) {
+                if (enrichedSubs[i].scene_number === prevScene && !enrichedSubs[i].tag) {
+                    setFocus(i);
+                    const group = document.querySelector(`.sub-row[data-idx="${i}"]`)?.closest('.scene-group');
+                    if (group && group.classList.contains('collapsed')) group.classList.remove('collapsed');
+                    return;
+                }
+            }
+        }
+    }
+}
+
+// ============================================================
+// PICKER
+// ============================================================
+function openPicker(idx) {
+    closePicker();
+    pickerOpenIndex = idx;
+    const el = document.getElementById(`picker_${idx}`);
+    if (el) {
+        el.classList.add('open');
+        const item = enrichedSubs[idx];
+        item._idx = idx;
+        el.innerHTML = buildPickerHtml(item);
+        setTimeout(() => {
+            const search = document.getElementById('pickerSearch');
+            if (search) search.focus();
+        }, 50);
+    }
+}
+
+function closePicker() {
+    if (pickerOpenIndex >= 0) {
+        const el = document.getElementById(`picker_${pickerOpenIndex}`);
+        if (el) { el.classList.remove('open'); el.innerHTML = ''; }
+    }
+    pickerOpenIndex = -1;
+}
+
+// ============================================================
+// PANEL TOGGLES
+// ============================================================
+function toggleScenePanel() {
+    const p = document.getElementById('scenePanel');
+    p.classList.toggle('visible');
+    document.getElementById('btnScene').classList.toggle('active', p.classList.contains('visible'));
+    localStorage.setItem('vt_scene_panel', p.classList.contains('visible') ? '1' : '0');
+}
+
+function toggleCharPanel() {
+    const p = document.getElementById('charPanel');
+    p.classList.toggle('visible');
+    document.getElementById('btnChars').classList.toggle('active', p.classList.contains('visible'));
+    localStorage.setItem('vt_char_panel', p.classList.contains('visible') ? '1' : '0');
+}
+
+function setFilter(mode) {
+    filterMode = mode;
+    document.getElementById('filterAll').classList.toggle('active', mode === 'all');
+    document.getElementById('filterUntagged').classList.toggle('active', mode === 'untagged');
+    renderSubList();
+}
+
+// ============================================================
+// SCENE PANEL (reused from old UI, simplified)
+// ============================================================
+async function updateScenePanel(timeSec) {
+    if (!currentEpisode) return;
+    if (!document.getElementById('scenePanel').classList.contains('visible')) return;
+    if (currentSceneRange && timeSec >= currentSceneRange.start && timeSec <= currentSceneRange.end) return;
+
+    const scene = await fetchJson(`/api/episode/${currentEpisode}/scene_at_time`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ time_sec: timeSec }),
+    });
+    if (!scene || !scene.scene_number) {
+        currentSceneNumber = null; currentSceneRange = null; currentSceneData = null;
+        document.getElementById('sceneContent').innerHTML = '<div style="color:#555;text-align:center">No scene data</div>';
+        return;
+    }
+    currentSceneNumber = scene.scene_number;
+    currentSceneRange = { start: scene.start_time_seconds, end: scene.end_time_seconds };
+    currentSceneData = scene;
+
+    let html = `<div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;flex-wrap:wrap">`;
+    html += `<span style="font-weight:700">Scene ${scene.scene_number}</span>`;
+    html += `<span class="scene-badge ${scene.scene_type || ''}">${scene.scene_type || '?'}</span>`;
+    if (scene.emotional_tone) html += `<span style="color:#888;font-size:11px">${escapeHtml(scene.emotional_tone)}</span>`;
+    html += '</div>';
+    html += `<div style="font-family:monospace;font-size:10px;color:#888;margin-bottom:4px">${formatTime(scene.start_time_seconds)} - ${formatTime(scene.end_time_seconds)}</div>`;
+    if (scene.location) html += `<div style="color:#8af;font-size:11px;margin-bottom:4px">${escapeHtml(scene.location)}</div>`;
+    if (scene.scene_narrative) html += `<div class="scene-narrative">${escapeHtml(scene.scene_narrative)}</div>`;
+
+    for (const c of (scene.characters_present || [])) {
+        const name = c.name || c.character_id || '';
+        html += `<div class="scene-char"><span class="scene-char-name" style="color:${charColor(name)}">${escapeHtml(name)}</span>`;
+        if (c.action) html += ` <span style="color:#888;font-size:10px">${escapeHtml(c.action)}</span>`;
+        html += '</div>';
+    }
+
+    const tes = scene.text_elements || [];
+    if (tes.length > 0) {
+        html += `<div style="margin-top:6px;font-size:10px;color:#555;text-transform:uppercase">Dialogue (${tes.length})</div>`;
+        for (const te of tes) {
+            const conf = te.speaker_confidence || 0;
+            const borderColor = te.speaker && te.speaker !== 'Unknown' ? charColor(te.speaker) : '#444';
+            html += `<div class="te-item" style="border-left-color:${borderColor}" onclick="videoPlayer.currentTime=${te.start_time_seconds||0}">`;
+            html += `<span style="font-weight:700;color:${te.speaker ? charColor(te.speaker) : '#888'};font-size:11px">${escapeHtml(te.speaker||'?')}</span>`;
+            html += ` <span style="color:#666;font-size:9px">${Math.round(conf*100)}%</span>`;
+            html += `<div style="color:#bbb;font-size:11px">${escapeHtml(te.content||'')}</div>`;
+            html += '</div>';
+        }
+    }
+    document.getElementById('sceneContent').innerHTML = html;
 }
 
 // ============================================================
 // CHARACTER PANEL
 // ============================================================
-function addToRecent(name) {
-    if (!name) return;
-    recentCharacters = recentCharacters.filter(n => n !== name);
-    recentCharacters.unshift(name);
-    if (recentCharacters.length > MAX_RECENT) recentCharacters.pop();
-    renderRecentChars();
-}
-
-function renderRecentChars() {
-    const container = document.getElementById('recentChars');
-    container.innerHTML = '';
-    if (recentCharacters.length === 0) {
-        container.innerHTML = '<span style="font-size:10px;color:#555">Recent picks appear here</span>';
-        return;
-    }
-    for (const name of recentCharacters) {
-        const chip = document.createElement('span');
-        chip.className = 'recent-chip';
-        chip.textContent = name;
-        chip.style.color = charColor(name);
-        chip.style.borderColor = charColor(name) + '88';
-        if (name === selectedCharacter) chip.classList.add('selected');
-        chip.addEventListener('click', () => {
-            selectedCharacter = name;
-            renderCharacterPanel();
-            renderRecentChars();
-        });
-        container.appendChild(chip);
-    }
-}
-
-function renderCharacterPanel() {
-    const list = document.getElementById('charList');
+function renderCharPanel() {
+    const list = document.getElementById('charPanelList');
+    if (!list) return;
     list.innerHTML = '';
+    const query = (document.getElementById('charPanelSearch')?.value || '').toLowerCase();
 
-    const query = (document.getElementById('charSearch').value || '').toLowerCase();
-
-    // Sort: characters with tags first, then alphabetical
     const names = Object.keys(characters).sort((a, b) => {
         const aSec = characters[a].total_seconds;
         const bSec = characters[b].total_seconds;
@@ -1113,286 +1373,135 @@ function renderCharacterPanel() {
         const ch = characters[name];
         const item = document.createElement('div');
         item.className = 'char-item';
-        if (name === selectedCharacter) item.classList.add('selected');
-        if (ch.status === 'ready') item.classList.add('ready');
-
         const pct = Math.min(100, (ch.total_seconds / 90) * 100);
         const fillColor = ch.status === 'ready' ? '#4caf50' : charColor(name);
-
-        // Reference thumbnail
-        const thumbSrc = ch.reference_images.length > 0
-            ? `/reference/${name}/${ch.reference_images[0]}`
-            : '';
-
+        const thumbSrc = ch.reference_images?.length > 0 ? `/reference/${name}/${ch.reference_images[0]}` : '';
         item.innerHTML = `
-            ${thumbSrc ? `<img class="char-thumb" src="${thumbSrc}" alt="${name}">` : '<div class="char-thumb"></div>'}
+            ${thumbSrc ? `<img class="char-thumb" src="${thumbSrc}" alt="">` : '<div class="char-thumb"></div>'}
             <div class="char-info">
-                <div class="char-name">${name}</div>
-                <div class="char-progress">
-                    <div class="progress-bar">
-                        <div class="progress-fill" style="width:${pct}%;background:${fillColor}"></div>
-                    </div>
-                    <span class="progress-text">${ch.total_seconds}s${ch.status === 'ready' ? ' OK' : ''}</span>
-                </div>
-            </div>
-        `;
-
-        item.addEventListener('click', () => {
-            selectedCharacter = name;
-            addToRecent(name);
-            renderCharacterPanel();
-        });
-
+                <div class="char-name" style="color:${charColorLight(name)}">${escapeHtml(name)}</div>
+                <div class="progress-bar"><div class="progress-fill" style="width:${pct}%;background:${fillColor}"></div></div>
+                <span class="progress-text">${ch.total_seconds}s / ${ch.total_tags} tags</span>
+            </div>`;
         list.appendChild(item);
     }
-
-    renderRecentChars();
 }
 
 // ============================================================
-// FACE SCANNING
+// VIDEO
 // ============================================================
-// ============================================================
-// FRAME ANALYSIS — VLM scene lookup
-// ============================================================
-async function analyzeFrame() {
-    if (!currentEpisode) return;
-    const time = videoPlayer.currentTime;
-    setStatus('Looking up scene...');
-
-    const result = await fetchJson(`/api/episode/${currentEpisode}/analyze_frame`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ time_sec: time }),
-    });
-
-    showScenePopup(result);
-    const charNames = (result.characters || []).map(c => c.name).join(', ');
-    setStatus(result.characters.length > 0 ? `Characters: ${charNames}` : 'No characters in this scene');
+function seekRelative(sec) {
+    videoPlayer.currentTime = Math.max(0, videoPlayer.currentTime + sec);
 }
 
-function showScenePopup(result) {
-    const popup = document.getElementById('facePopup');
-    const videoRect = videoPlayer.getBoundingClientRect();
-    popup.style.left = (videoRect.right - 260) + 'px';
-    popup.style.top = (videoRect.top + 10) + 'px';
-    popup.style.display = 'block';
+videoPlayer.addEventListener('timeupdate', () => {
+    const cur = videoPlayer.currentTime;
+    const dur = videoPlayer.duration || 0;
+    document.getElementById('timeDisplay').textContent = `${formatTime(cur)} / ${formatTime(dur)}`;
 
-    let html = '';
-    if (result.scene) {
-        html += `<div style="font-size:11px;color:#888;margin-bottom:6px">Scene ${result.scene.scene_number}</div>`;
-        html += `<div style="font-size:11px;color:#aaa;margin-bottom:8px">${result.scene.narrative}</div>`;
+    const now = Date.now();
+    if (now - lastSceneUpdateTime > 1000) {
+        lastSceneUpdateTime = now;
+        updateScenePanel(cur);
     }
-    html += '<div style="font-weight:700;margin-bottom:4px">Characters:</div>';
-    if (result.characters && result.characters.length > 0) {
-        for (const c of result.characters) {
-            const escapedName = c.name.replace(/'/g, "\\'");
-            html += `<div class="face-match" onclick="selectCharacterByName('${escapedName}');hideFacePopup()">
-                <span style="color:${charColor(c.name)}">${c.name}</span>
-                <span class="sim" style="font-size:10px">${c.action}</span>
-            </div>`;
-        }
-    } else {
-        html += '<div style="color:#888">No characters identified</div>';
-    }
-    popup.innerHTML = html;
-}
+});
 
-function hideFacePopup() {
-    document.getElementById('facePopup').style.display = 'none';
-}
-
-function selectCharacterByName(name) {
-    selectedCharacter = name;
-    renderCharacterPanel();
-}
-
-// ============================================================
-// RECOMMENDATIONS
-// ============================================================
-async function refreshRecommendations() {
-    if (!currentEpisode) return;
-    recommendations = await fetchJson(`/api/episode/${currentEpisode}/recommendations`);
-    renderRecommendations();
-    renderSubtitleStrip();
-}
-
-function renderRecommendations() {
-    const container = document.getElementById('recsList');
-    container.innerHTML = '';
-
-    if (recommendations.length === 0) {
-        container.innerHTML = '<div style="color:#666;font-size:12px">No recommendations. Click "Refresh Recs" after loading an episode.</div>';
-        return;
-    }
-
-    for (const rec of recommendations.slice(0, 50)) {
-        const item = document.createElement('div');
-        item.className = 'rec-item';
-        item.innerHTML = `
-            <span class="rec-char" style="color:${charColor(rec.character)}">${rec.character}</span>
-            <span class="rec-score">${(rec.score*100).toFixed(0)}%</span>
-            <span class="rec-text">${formatTime(rec.start_sec)} ${rec.subtitle_text.substring(0, 60)}</span>
-            <div class="rec-actions">
-                <button class="rec-accept" onclick="acceptRec(${rec.start_sec}, ${rec.end_sec}, '${escapeJs(rec.subtitle_text)}', '${escapeJs(rec.character)}')">Accept</button>
-                <button class="rec-dismiss">Dismiss</button>
-            </div>
-        `;
-        item.addEventListener('click', (e) => {
-            if (e.target.tagName === 'BUTTON') return;
-            videoPlayer.currentTime = rec.start_sec;
-        });
-        container.appendChild(item);
-    }
-}
-
-async function acceptRec(start, end, text, character) {
-    if (!currentEpisode) return;
-    await fetchJson(`/api/episode/${currentEpisode}/tags`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({
-            character: character,
-            start_sec: start,
-            end_sec: end,
-            subtitle_text: text,
-        }),
-    });
-    addToRecent(character);
-    await refreshTags();
-    await loadCharacters();
-    await refreshRecommendations();
-    setStatus(`Accepted: ${character}`);
-}
-
-// ============================================================
-// AUDIO EXTRACTION
-// ============================================================
-async function extractSample(tagId) {
-    if (!currentEpisode) return;
-    setStatus('Extracting audio...');
-    const result = await fetchJson(`/api/episode/${currentEpisode}/extract_sample`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ tag_id: tagId, use_demucs: false }),
-    });
-    setStatus(result.path ? 'Audio extracted!' : 'Extraction failed');
-}
-
-async function extractAllSamples() {
-    if (!currentEpisode || tags.length === 0) return;
-    setStatus(`Extracting audio for ${tags.length} tags...`);
-    for (const tag of tags) {
-        await fetchJson(`/api/episode/${currentEpisode}/extract_sample`, {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ tag_id: tag.tag_id, use_demucs: false }),
-        });
-    }
-    setStatus('All audio extracted!');
-}
-
-// ============================================================
-// VOICE CLONE EVALUATION
-// ============================================================
-async function evaluateClone() {
-    if (!selectedCharacter) {
-        setStatus('Select a character first');
-        return;
-    }
-    setStatus(`Evaluating voice clone for ${selectedCharacter}...`);
-    document.getElementById('qualityOverlay').style.display = 'block';
-    document.getElementById('qualityCard').style.display = 'block';
-    document.getElementById('qualityContent').innerHTML = '<div style="text-align:center;color:#888">Synthesizing and scoring...</div>';
-
-    const result = await fetchJson(`/api/character/${selectedCharacter}/evaluate`, { method: 'POST' });
-    renderQualityCard(result);
-    setStatus('Evaluation complete');
-}
-
-function renderQualityCard(result) {
-    const content = document.getElementById('qualityContent');
-    if (result.status === 'no_samples' || result.status === 'insufficient') {
-        content.innerHTML = `
-            <div class="score poor">${result.status === 'no_samples' ? 'N/A' : 'Insufficient'}</div>
-            <div class="details">${result.message}</div>
-        `;
-        return;
-    }
-    if (result.status === 'error') {
-        content.innerHTML = `<div class="score poor">Error</div><div class="details">${result.message}</div>`;
-        return;
-    }
-
-    const q = result.quality || 'unknown';
-    content.innerHTML = `
-        <div class="score ${q}">${result.speaker_similarity ? (result.speaker_similarity * 100).toFixed(0) + '%' : '?'}</div>
-        <div style="text-align:center;margin-bottom:12px;color:${q === 'excellent' ? '#4caf50' : q === 'good' ? '#8bc34a' : q === 'acceptable' ? '#ffc107' : '#f44336'}">${q.toUpperCase()}</div>
-        <div class="details">
-            <b>Character:</b> ${result.character}<br>
-            <b>Samples:</b> ${result.total_samples} clips, ${result.total_duration}s total<br>
-            <b>References used:</b> ${result.ref_clips_used} clips, ${result.ref_duration}s<br>
-            <b>Speaker similarity:</b> ${result.speaker_similarity}<br>
-            <b>Status:</b> ${result.status}<br>
-            ${result.synth_path ? `<br><audio controls src="/evaluation/${result.character}/test_synthesis.wav" style="width:100%"></audio>` : ''}
-        </div>
-    `;
-}
-
-function closeQualityCard() {
-    document.getElementById('qualityOverlay').style.display = 'none';
-    document.getElementById('qualityCard').style.display = 'none';
-}
+videoPlayer.addEventListener('seeked', () => {
+    currentSceneRange = null;
+    updateScenePanel(videoPlayer.currentTime);
+});
 
 // ============================================================
 // KEYBOARD SHORTCUTS
 // ============================================================
 document.addEventListener('keydown', (e) => {
-    // Don't capture if typing in an input
-    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
+        if (e.key === 'Escape') { closePicker(); e.target.blur(); }
+        return;
+    }
+
+    const focused = focusedIndex >= 0 ? enrichedSubs[focusedIndex] : null;
 
     switch (e.key) {
         case ' ':
             e.preventDefault();
             videoPlayer.paused ? videoPlayer.play() : videoPlayer.pause();
             break;
-        case 'ArrowLeft':
+        case 'j': case 'ArrowDown':
             e.preventDefault();
-            seekRelative(e.shiftKey ? -1 : -5);
+            focusNextUntagged(1);
+            if (focusedIndex >= 0) videoPlayer.currentTime = enrichedSubs[focusedIndex].start;
             break;
-        case 'ArrowRight':
+        case 'k': case 'ArrowUp':
             e.preventDefault();
-            seekRelative(e.shiftKey ? 1 : 5);
+            focusNextUntagged(-1);
+            if (focusedIndex >= 0) videoPlayer.currentTime = enrichedSubs[focusedIndex].start;
+            break;
+        case 'y': case 'Y':
+            e.preventDefault();
+            if (e.ctrlKey && e.shiftKey) { acceptAllTier1(); }
+            else if (e.shiftKey) { acceptSceneTier1(); }
+            else if (focused && !focused.tag && focused.suggested_character) { acceptSuggestion(focusedIndex); }
+            break;
+        case 'n': case 'N':
+            e.preventDefault();
+            if (focused && !focused.tag) openPicker(focusedIndex);
             break;
         case '[':
             e.preventDefault();
-            markStart();
+            jumpScene(-1);
             break;
         case ']':
             e.preventDefault();
-            markEnd();
+            jumpScene(1);
             break;
-        case 'Enter':
+        case 'f': case 'F':
             e.preventDefault();
-            createTagFromSelection();
+            setFilter(filterMode === 'all' ? 'untagged' : 'all');
             break;
-        case 'a':
-        case 'A':
-            if (!e.ctrlKey && !e.metaKey) {
-                e.preventDefault();
-                analyzeFrame();
-            }
+        case 's':
+            if (!e.ctrlKey) { e.preventDefault(); toggleScenePanel(); }
+            break;
+        case 'c':
+            if (!e.ctrlKey) { e.preventDefault(); toggleCharPanel(); }
             break;
         case 'Escape':
-            clearSelection();
-            hideFacePopup();
-            closeQualityCard();
+            closePicker();
+            break;
+        default:
+            // 1-9: quick assign scene characters
+            if (e.key >= '1' && e.key <= '9' && focused && !focused.tag) {
+                const ci = parseInt(e.key) - 1;
+                const chars = focused.scene_chars || [];
+                if (ci < chars.length) {
+                    e.preventDefault();
+                    assignCharacter(focusedIndex, chars[ci].name);
+                }
+            }
             break;
     }
 });
 
 // ============================================================
-// UTILITY FUNCTIONS
+// RECENT CHARACTERS
+// ============================================================
+function addToRecent(name) {
+    if (!name) return;
+    recentCharacters = recentCharacters.filter(n => n !== name);
+    recentCharacters.unshift(name);
+    if (recentCharacters.length > MAX_RECENT) recentCharacters.pop();
+}
+
+// ============================================================
+// QUALITY CARD (kept from old UI)
+// ============================================================
+function closeQualityCard() {
+    document.getElementById('qualityOverlay').style.display = 'none';
+    document.getElementById('qualityCard').style.display = 'none';
+}
+
+// ============================================================
+// UTILITY
 // ============================================================
 function formatTime(sec) {
     if (sec == null || isNaN(sec)) return '0:00';
@@ -1401,8 +1510,15 @@ function formatTime(sec) {
     return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-function setStatus(msg) {
-    document.getElementById('statusText').textContent = msg;
+function setStatus(msg) { document.getElementById('statusText').textContent = msg; }
+
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function escapeJs(str) {
+    return (str || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"');
 }
 
 async function fetchJson(url, opts = {}) {
@@ -1415,8 +1531,273 @@ async function fetchJson(url, opts = {}) {
     }
 }
 
-function escapeJs(str) {
-    return (str || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"');
+// ============================================================
+// DIARIZATION UI
+// ============================================================
+let diarGroups = [];
+let diarAccepted = new Set();   // cluster_ids confirmed this session
+let diarJobId = null;
+let diarPollTimer = null;
+
+async function openDiarModal() {
+    document.getElementById('diarOverlay').style.display = 'block';
+    document.getElementById('diarModal').classList.add('open');
+    diarAccepted = new Set();
+    await loadDiarGroups();
+}
+
+function closeDiarModal() {
+    document.getElementById('diarOverlay').style.display = 'none';
+    document.getElementById('diarModal').classList.remove('open');
+    if (diarPollTimer) { clearInterval(diarPollTimer); diarPollTimer = null; }
+    if (diarAccepted.size > 0) {
+        refreshEnriched();
+        setStatus(`Applied diarization: ${diarAccepted.size} groups confirmed`);
+    }
+}
+
+async function loadDiarGroups() {
+    if (!currentEpisode) {
+        document.getElementById('diarBody').innerHTML =
+            '<div style="text-align:center;padding:60px;color:#555">Select an episode first.</div>';
+        return;
+    }
+    document.getElementById('diarBody').innerHTML =
+        '<div style="text-align:center;padding:40px;color:#888">Loading...</div>';
+
+    const data = await fetchJson(`/api/episode/${currentEpisode}/diarization_groups`);
+    if (data.status === 'not_found') {
+        renderDiarRunPrompt();
+    } else if (data.status === 'done') {
+        diarGroups = data.groups || [];
+        renderDiarGroups();
+    } else {
+        document.getElementById('diarBody').innerHTML =
+            `<div style="text-align:center;padding:40px;color:#888">Status: ${escapeHtml(data.status || 'unknown')}</div>`;
+    }
+}
+
+function renderDiarRunPrompt() {
+    document.getElementById('diarHeaderStatus').textContent = 'No diarization data';
+    document.getElementById('diarBody').innerHTML = `
+        <div class="diar-run-section">
+            <p>
+                Run VLM-guided per-segment speaker diarization.<br>
+                Uses pyannote 3.1 + Demucs for vocal isolation.<br>
+                <strong>One-time preprocessing: ~5-8 min on GPU. Results cached.</strong>
+            </p>
+            <p style="font-size:12px;color:#666">
+                Requires <code>HF_TOKEN</code> env variable and pyannote model access.<br>
+                See <code>voice/DIARIZATION_PLAN.md</code> for setup details.
+            </p>
+            <button class="tb-btn accept-all" onclick="triggerDiarization()"
+                    style="padding:10px 28px;font-size:14px">
+                Run Diarization
+            </button>
+        </div>`;
+}
+
+async function triggerDiarization() {
+    if (!currentEpisode) return;
+    document.getElementById('diarBody').innerHTML =
+        '<div class="diar-progress-wrap">Starting diarization pipeline...</div>';
+
+    const resp = await fetchJson(`/api/episode/${currentEpisode}/diarization_run`, { method: 'POST' });
+    if (!resp.ok || !resp.job_id) {
+        document.getElementById('diarBody').innerHTML =
+            `<div class="diar-progress-wrap" style="color:#f66">Failed to start: ${escapeHtml(resp.error || 'unknown error')}</div>`;
+        return;
+    }
+    diarJobId = resp.job_id;
+    diarPollTimer = setInterval(pollDiarStatus, 2000);
+}
+
+async function pollDiarStatus() {
+    if (!diarJobId || !currentEpisode) return;
+    const status = await fetchJson(
+        `/api/episode/${currentEpisode}/diarization_status?job_id=${diarJobId}`
+    );
+    const pct = status.progress || 0;
+    const msg = status.message || 'Running...';
+
+    if (status.status === 'done') {
+        clearInterval(diarPollTimer); diarPollTimer = null; diarJobId = null;
+        await loadDiarGroups();
+    } else if (status.status === 'error') {
+        clearInterval(diarPollTimer); diarPollTimer = null;
+        document.getElementById('diarBody').innerHTML =
+            `<div class="diar-progress-wrap" style="color:#f66">
+                <strong>Error:</strong> ${escapeHtml(msg)}
+             </div>`;
+    } else {
+        document.getElementById('diarBody').innerHTML = `
+            <div class="diar-progress-wrap">
+                <div style="color:#aaa;margin-bottom:12px">${escapeHtml(msg)}</div>
+                <div class="diar-progress-bar">
+                    <div class="diar-progress-fill" style="width:${pct}%"></div>
+                </div>
+                <div style="margin-top:8px;color:#555;font-size:12px">${pct}%</div>
+            </div>`;
+    }
+}
+
+function renderDiarGroups() {
+    const clean   = diarGroups.filter(g => g.tier === 'clean').length;
+    const likely  = diarGroups.filter(g => g.tier === 'likely').length;
+    const impure  = diarGroups.filter(g => g.tier === 'impure').length;
+    document.getElementById('diarHeaderStatus').innerHTML =
+        `${diarGroups.length} groups &mdash; `
+        + `<span style="color:#4caf50">clean:${clean}</span> `
+        + `<span style="color:#ffc107">likely:${likely}</span> `
+        + `<span style="color:#f66">impure:${impure}</span>`;
+
+    const body = document.getElementById('diarBody');
+    body.innerHTML = '';
+
+    if (diarGroups.length === 0) {
+        body.innerHTML = '<div style="text-align:center;padding:60px;color:#555">No speaker groups found.</div>';
+        return;
+    }
+
+    // Group by scene number
+    const byScene = {};
+    for (const g of diarGroups) {
+        const sn = g.scene_number;
+        if (!byScene[sn]) byScene[sn] = [];
+        byScene[sn].push(g);
+    }
+
+    for (const sn of Object.keys(byScene).sort((a, b) => +a - +b)) {
+        const section = document.createElement('div');
+        section.className = 'diar-scene-section';
+        section.innerHTML = `<div class="diar-scene-label">Scene ${sn}</div>`;
+        for (const group of byScene[sn]) {
+            section.appendChild(createDiarRow(group));
+        }
+        body.appendChild(section);
+    }
+}
+
+function createDiarRow(group) {
+    const div = document.createElement('div');
+    div.className = `diar-group tier-${group.tier}${diarAccepted.has(group.cluster_id) ? ' dg-accepted' : ''}`;
+    div.id = `dg_${group.cluster_id}`;
+
+    const char = group.character;
+    const pct  = Math.round(group.confidence * 100);
+    const breakdown = Object.entries(group.vlm_breakdown || {})
+        .map(([c, n]) => `${c}\u00d7${n}`).join('  ');
+
+    div.innerHTML = `
+        <div class="dg-meta">
+            <div class="dg-seg">${escapeHtml(group.segment_id)}</div>
+            <div class="dg-spk">${escapeHtml(group.speaker_label)}</div>
+            <div class="dg-stats">${group.subtitle_count} lines &middot; ${group.total_duration_sec.toFixed(1)}s</div>
+        </div>
+        <div class="dg-suggestion">
+            ${char
+                ? `<span class="dg-char" style="color:${charColorLight(char)}">${escapeHtml(char)}</span>
+                   <span class="dg-conf">${pct}%</span>`
+                : `<span style="color:#555">No VLM match</span>`}
+            <span class="dg-breakdown" title="${escapeHtml(breakdown)}">${escapeHtml(breakdown)}</span>
+            <span class="dg-tier-badge ${group.tier}">${group.tier}</span>
+        </div>
+        <div class="dg-actions" id="dgact_${group.cluster_id}">
+            <button class="dg-btn dg-seek"
+                    onclick="seekDiarSample(${group.sample_start_sec})">&#9654;</button>
+            ${char
+                ? `<button class="dg-btn dg-confirm" id="dgbtn_${group.cluster_id}"
+                           data-cluster="${escapeHtml(group.cluster_id)}"
+                           data-char="${escapeHtml(char)}"
+                           onclick="confirmDiarGroup(this)">
+                       ${escapeHtml(char)} &#10003;
+                   </button>`
+                : ''}
+            <button class="dg-btn dg-change"
+                    data-cluster="${escapeHtml(group.cluster_id)}"
+                    onclick="changeDiarChar(this)">&#8230;</button>
+        </div>`;
+
+    return div;
+}
+
+function seekDiarSample(startSec) {
+    videoPlayer.currentTime = startSec;
+    videoPlayer.play();
+}
+
+async function confirmDiarGroup(btn) {
+    const clusterId = btn.dataset.cluster;
+    const character = btn.dataset.char;
+    if (!clusterId || !character) return;
+    btn.textContent = '...';
+    btn.disabled = true;
+
+    const resp = await fetchJson(
+        `/api/episode/${currentEpisode}/diarization_accept`,
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ accepts: [{ cluster_id: clusterId, character }] }),
+        }
+    );
+    diarAccepted.add(clusterId);
+    const row = document.getElementById(`dg_${clusterId}`);
+    if (row) row.classList.add('dg-accepted');
+    btn.textContent = '\u2713 Done';
+    btn.className = 'dg-btn dg-done';
+    btn.disabled = true;
+}
+
+function changeDiarChar(changeBtn) {
+    const clusterId = changeBtn.dataset.cluster;
+    const char = prompt('Enter character name:', '');
+    if (!char || !char.trim()) return;
+    const character = char.trim();
+
+    // Update the confirm button and trigger confirmation
+    const confirmBtn = document.getElementById(`dgbtn_${clusterId}`);
+    if (confirmBtn) {
+        confirmBtn.dataset.char = character;
+        confirmBtn.textContent = character + ' \u2713';
+        confirmDiarGroup(confirmBtn);
+    } else {
+        // No confirm button existed (no VLM match) — create the tag directly
+        fetchJson(`/api/episode/${currentEpisode}/diarization_accept`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ accepts: [{ cluster_id: clusterId, character }] }),
+        }).then(() => {
+            diarAccepted.add(clusterId);
+            const row = document.getElementById(`dg_${clusterId}`);
+            if (row) row.classList.add('dg-accepted');
+        });
+    }
+}
+
+async function acceptAllCleanGroups() {
+    const pending = diarGroups.filter(
+        g => g.tier === 'clean' && g.character && !diarAccepted.has(g.cluster_id)
+    );
+    if (pending.length === 0) { setStatus('No clean groups remaining to accept.'); return; }
+
+    const accepts = pending.map(g => ({ cluster_id: g.cluster_id, character: g.character }));
+    const resp = await fetchJson(
+        `/api/episode/${currentEpisode}/diarization_accept`,
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ accepts }),
+        }
+    );
+    for (const g of pending) {
+        diarAccepted.add(g.cluster_id);
+        const row = document.getElementById(`dg_${g.cluster_id}`);
+        if (row) row.classList.add('dg-accepted');
+        const btn = document.getElementById(`dgbtn_${g.cluster_id}`);
+        if (btn) { btn.textContent = '\u2713 Done'; btn.className = 'dg-btn dg-done'; btn.disabled = true; }
+    }
+    setStatus(`Diarization: tagged ${resp.tagged || 0} lines from ${pending.length} clean groups`);
 }
 
 // Start
@@ -1436,13 +1817,12 @@ if __name__ == "__main__":
     print("  http://localhost:7861")
     print("=" * 60)
     print()
-    print("Workflow:")
-    print("  1. Select an episode (VLM scene data auto-loads)")
-    print("  2. Click 'Refresh Recs' for character recommendations")
-    print("  3. Accept recs or select a character + right-click subtitles to quick-tag")
-    print("  4. Press 'A' to analyze current frame (shows VLM characters)")
-    print("  5. Click 'Extract All Audio' when done tagging")
-    print("  6. Click 'Clone Voice' to test quality")
+    print("Triage workflow:")
+    print("  1. Select an episode (enriched subtitles load automatically)")
+    print("  2. Click 'Accept All Tier 1' to tag ~40-60% instantly")
+    print("  3. Press J/K to navigate untagged, Y to accept, 1-9 to quick-assign")
+    print("  4. Press N to open character picker for tricky lines")
+    print("  5. Press F to filter to untagged only, S/C to toggle panels")
     print()
 
     app.run(host="0.0.0.0", port=7861, debug=False, threaded=True)

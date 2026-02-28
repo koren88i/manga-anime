@@ -13,9 +13,17 @@ with open("output/anime_metadata/0001/shots_features.json") as f:
     shots = json.load(f)
 print(f"Loaded {len(shots)} shots with features")
 
+# Load subtitles for eyecatch detection
+subtitle_segments = None
+subs_path = "output/anime_metadata/0001/subtitles_raw.json"
+if os.path.exists(subs_path):
+    with open(subs_path) as f:
+        subtitle_segments = json.load(f)
+    print(f"Loaded {len(subtitle_segments)} subtitle segments")
+
 # Eyecatch detection
 t0 = time.time()
-eyecatch_ids = detect_eyecatch(shots)
+eyecatch_ids = detect_eyecatch(shots, subtitle_segments=subtitle_segments)
 print(f"Eyecatch shot IDs: {eyecatch_ids}")
 
 # Mark eyecatch

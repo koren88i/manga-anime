@@ -115,6 +115,11 @@ CONFIG = {
     "weight_music_continuity": 0.03,     # music continuing across boundary = weak anti-break (anime BGM spans scenes)
     "weight_music_cut": 0.20,            # music stopping at boundary = pro-break signal
     "weight_silence_onset": 0.10,        # silence onset at boundary = moderate pro-break
+
+    # Eyecatch detection (subtitle-gap-based)
+    "eyecatch_min_gap_duration": 4.0,    # minimum subtitle gap to consider (seconds)
+    "eyecatch_max_gap_duration": 30.0,   # maximum subtitle gap to consider (seconds)
+    "eyecatch_midpoint_window": 0.15,    # search within +/- this fraction of total duration
 }
 
 
@@ -1267,11 +1272,16 @@ def _build_scene(scene_number, scene_shots):
 # Eyecatch detection
 # ---------------------------------------------------------------------------
 
-def detect_eyecatch(shots, config=None):
+def detect_eyecatch(shots, subtitle_segments=None, config=None):
     """
     Detect mid-episode eyecatch (title card break) in One Piece episodes.
-    Eyecatch is typically: very short shot (< 5s), high brightness, preceded and
-    followed by fade-to-black. Located roughly in the middle of the episode.
+
+    Primary method (when subtitle_segments provided): Find the most prominent
+    subtitle gap near the episode midpoint — the eyecatch is always a dialogue-
+    free region. Gaps are scored by duration * proximity to midpoint.
+
+    Fallback (no subtitles, e.g. standalone mode): Per-shot brightness +
+    fade_to_black/fade_to_white heuristics only.
 
     Returns list of shot_ids that are eyecatch frames, or empty list.
     """
@@ -1282,60 +1292,118 @@ def detect_eyecatch(shots, config=None):
 
     total_duration = shots[-1]["end_time"] - shots[0]["start_time"]
     mid_point = total_duration / 2.0
-    mid_window = total_duration * 0.15  # search within ±15% of midpoint
+    mid_window = total_duration * cfg.get("eyecatch_midpoint_window", 0.15)
 
+    # Primary: subtitle gap analysis
+    if subtitle_segments and len(subtitle_segments) > 1:
+        eyecatch_ids = _detect_eyecatch_by_subtitle_gap(
+            shots, subtitle_segments, mid_point, mid_window, cfg
+        )
+        if eyecatch_ids:
+            return eyecatch_ids
+
+    # Fallback: strict fade+brightness heuristic (no dissolve)
+    return _detect_eyecatch_by_fades(shots, mid_point, mid_window, cfg)
+
+
+def _detect_eyecatch_by_subtitle_gap(shots, subtitle_segments, mid_point,
+                                      mid_window, cfg):
+    """
+    Find subtitle gaps near the midpoint that match eyecatch duration.
+    Score each gap by duration * proximity to midpoint — longer gaps closer
+    to the midpoint score highest. Returns shot_ids of all shots fully
+    contained within the best gap.
+    """
+    min_gap = cfg.get("eyecatch_min_gap_duration", 4.0)
+    max_gap = cfg.get("eyecatch_max_gap_duration", 30.0)
+
+    # Sort subtitle segments by start time
+    sorted_subs = sorted(subtitle_segments, key=lambda s: s["start"])
+
+    # Find candidate gaps between consecutive subtitle segments
+    candidates = []
+    for i in range(len(sorted_subs) - 1):
+        gap_start = sorted_subs[i]["end"]
+        gap_end = sorted_subs[i + 1]["start"]
+        gap_duration = gap_end - gap_start
+
+        if gap_duration < min_gap or gap_duration > max_gap:
+            continue
+
+        gap_mid = (gap_start + gap_end) / 2.0
+        distance_to_mid = abs(gap_mid - mid_point)
+        if distance_to_mid > mid_window:
+            continue
+
+        # Score: longer gaps closer to midpoint score highest
+        score = gap_duration * (1.0 - distance_to_mid / mid_window)
+        candidates.append({
+            "gap_start": gap_start,
+            "gap_end": gap_end,
+            "gap_duration": gap_duration,
+            "score": score,
+        })
+
+    if not candidates:
+        return []
+
+    best = max(candidates, key=lambda c: c["score"])
+
+    # Find all shots fully contained within the gap (with tolerance for
+    # subtitle timing imprecision)
+    tolerance = 0.5
+    region_start = best["gap_start"] - tolerance
+    region_end = best["gap_end"] + tolerance
+
+    eyecatch_ids = []
+    for shot in shots:
+        if shot["start_time"] >= region_start and shot["end_time"] <= region_end:
+            eyecatch_ids.append(shot["shot_id"])
+
+    if eyecatch_ids:
+        print(f"[Eyecatch Detection] Found eyecatch via subtitle gap: "
+              f"{best['gap_start']:.1f}s - {best['gap_end']:.1f}s "
+              f"({best['gap_duration']:.1f}s, {len(eyecatch_ids)} shots, "
+              f"score={best['score']:.1f})")
+
+    return eyecatch_ids
+
+
+def _detect_eyecatch_by_fades(shots, mid_point, mid_window, cfg):
+    """
+    Fallback eyecatch detection using per-shot brightness and
+    fade_to_black/fade_to_white heuristics. Only triggers on explicit
+    fade-to-black/white transitions, NOT dissolves.
+    """
     eyecatch_ids = []
 
     for i, shot in enumerate(shots):
         shot_mid = (shot["start_time"] + shot["end_time"]) / 2.0
 
-        # Must be near episode midpoint
         if abs(shot_mid - mid_point) > mid_window:
             continue
 
-        # Must be short
         if shot["duration"] > 5.0:
             continue
 
-        # Check for surrounding fades
         has_fade_before = (i > 0 and shots[i - 1].get("fade_type") in
                           ("fade_to_black", "fade_to_white"))
         has_fade_after = (shot.get("fade_type") in ("fade_to_black", "fade_to_white")
                          or (i + 1 < len(shots) and shots[i + 1].get("fade_type") in
                              ("fade_to_black", "fade_to_white")))
 
-        # Check brightness (from color palette — high V channel values)
         palette = shot.get("color_palette", [])
         if palette:
             bins = cfg["color_histogram_bins"]
-            # V channel is the last third of the palette
             v_hist = palette[2 * bins:3 * bins] if len(palette) >= 3 * bins else []
             if v_hist:
-                # High brightness = weight concentrated in upper bins
                 upper_weight = sum(v_hist[bins // 2:])
                 if upper_weight > 0.7 and has_fade_before and has_fade_after:
                     eyecatch_ids.append(shot["shot_id"])
 
     if eyecatch_ids:
-        print(f"[Eyecatch Detection] Found eyecatch at shot(s): {eyecatch_ids}")
-    else:
-        # Fallback: find very short shots near midpoint with fades on both sides
-        for i, shot in enumerate(shots):
-            shot_mid = (shot["start_time"] + shot["end_time"]) / 2.0
-            if abs(shot_mid - mid_point) > mid_window:
-                continue
-            if shot["duration"] > 3.0:
-                continue
-            has_fade_before = (i > 0 and shots[i - 1].get("fade_type") != "none")
-            has_fade_after = (i + 1 < len(shots) and
-                             shots[i + 1].get("fade_type") != "none")
-            if has_fade_before and has_fade_after:
-                eyecatch_ids.append(shot["shot_id"])
-                break
-
-        if eyecatch_ids:
-            print(f"[Eyecatch Detection] Found eyecatch (fallback) at shot(s): "
-                  f"{eyecatch_ids}")
+        print(f"[Eyecatch Detection] Found eyecatch (fade heuristic) at shot(s): "
+              f"{eyecatch_ids}")
 
     return eyecatch_ids
 
@@ -1344,7 +1412,8 @@ def detect_eyecatch(shots, config=None):
 # Standalone entry point for tuning
 # ---------------------------------------------------------------------------
 
-def run_standalone(video_path, audio_path=None, output_path=None, config_overrides=None):
+def run_standalone(video_path, audio_path=None, subtitle_path=None,
+                   output_path=None, config_overrides=None):
     """
     Run the full shot→scene pipeline standalone for tuning.
     Saves shot_index.json and scene_list.json to output_path.
@@ -1369,7 +1438,13 @@ def run_standalone(video_path, audio_path=None, output_path=None, config_overrid
     print(f"[Timing] Feature extraction: {t2 - t1:.1f}s")
 
     # Step 3: Eyecatch detection
-    eyecatch_ids = detect_eyecatch(shots, config=cfg)
+    subtitle_segments = None
+    if subtitle_path and os.path.exists(subtitle_path):
+        with open(subtitle_path) as f:
+            subtitle_segments = json.load(f)
+        print(f"[Eyecatch] Loaded {len(subtitle_segments)} subtitle segments")
+    eyecatch_ids = detect_eyecatch(shots, subtitle_segments=subtitle_segments,
+                                    config=cfg)
 
     # Step 4: Scene detection
     scenes = detect_scenes(shots, config=cfg)
@@ -1407,6 +1482,8 @@ if __name__ == "__main__":
     parser.add_argument("video", help="Path to episode video file (MKV/MP4)")
     parser.add_argument("--audio", help="Path to extracted audio (WAV). "
                         "If not provided, audio features are skipped.")
+    parser.add_argument("--subtitles", help="Path to subtitles_raw.json for "
+                        "subtitle-gap eyecatch detection")
     parser.add_argument("--output", default="output/scene_detector_debug",
                         help="Output directory for debug files")
     parser.add_argument("--threshold", type=float,
@@ -1422,5 +1499,6 @@ if __name__ == "__main__":
     if args.bg_threshold is not None:
         overrides["color_distance_threshold"] = args.bg_threshold
 
-    run_standalone(args.video, audio_path=args.audio, output_path=args.output,
+    run_standalone(args.video, audio_path=args.audio,
+                   subtitle_path=args.subtitles, output_path=args.output,
                    config_overrides=overrides)
